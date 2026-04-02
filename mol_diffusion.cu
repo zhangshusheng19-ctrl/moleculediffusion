@@ -229,7 +229,7 @@ __global__ void kernel_mse_reduce(
 float cuda_mse_loss(const float* d_pred, const float* d_target,
     float* d_loss, int N, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_loss, 0, sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
     int total   = N * 3;
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -273,7 +273,7 @@ __global__ void kernel_cross_entropy(
 float cuda_cross_entropy(const float* d_logits, const int* d_labels,
     float* d_loss, int N, int C, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_loss, 0, sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
     int threads = 256;
     int blocks  = (N + threads - 1) / threads;
     kernel_cross_entropy<<<blocks, threads, threads * sizeof(float), stream>>>(
@@ -447,7 +447,7 @@ void cuda_build_radius_graph(
     int* d_edge_src, int* d_edge_dst, int* d_n_edges,
     float radius, int N_total, int max_edges, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_n_edges, 0, sizeof(int), stream));
+    CUDA_CHECK(cudaMemset(d_n_edges, 0, sizeof(int)));
     int threads = 256;
     int blocks  = (N_total + threads - 1) / threads;
     kernel_build_radius_graph<<<blocks, threads, 0, stream>>>(
@@ -523,7 +523,7 @@ void cuda_scatter_add(
     const float* d_msg, const int* d_dst, float* d_agg,
     int E, int D, int N, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_agg, 0, (size_t)N * D * sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_agg, 0, (size_t)N * D * sizeof(float)));
     int threads = 256;
     int blocks  = (E + threads - 1) / threads;
     kernel_scatter_add<<<blocks, threads, 0, stream>>>(d_msg, d_dst, d_agg, E, D);
@@ -712,9 +712,9 @@ void cuda_fps(const float* d_xyz, int* d_fps_idx, float* d_dist_buf,
     // iteration could race with the tail of the previous iteration's kernels.
     // Using synchronous memset here makes the initialization order explicit and
     // removes the hazard entirely.
-    CUDA_CHECK(cudaMemset(d_dist_buf, 0x7f, (size_t)N * sizeof(float)));
-    // 0x7f repeated fills every byte → each float becomes 0x7f7f7f7f ≈ 3.4e38,
-    // which is less than FLT_MAX (0x7f7fffff ≈ 3.4e38) but large enough.
+    // Use 0x00 to initialize to 0.0f, then the first distance update will set
+    // proper values. Alternatively, use a kernel to fill with FLT_MAX.
+    CUDA_CHECK(cudaMemset(d_dist_buf, 0, (size_t)N * sizeof(float)));
 
     // Per-block argmax results — kept in device and pinned host memory.
     int* d_block_max = nullptr;
