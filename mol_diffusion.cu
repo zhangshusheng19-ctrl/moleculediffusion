@@ -51,9 +51,9 @@ void NoiseSchedule::allocate(int timesteps, float beta_start, float beta_end,
 
 void NoiseSchedule::free()
 {
-    cudaFree(d_betas);     cudaFree(d_alphas);
-    cudaFree(d_alpha_bar); cudaFree(d_sqrt_ab);
-    cudaFree(d_sqrt_1mab);
+    CUDA_CHECK(cudaFree(d_betas));     CUDA_CHECK(cudaFree(d_alphas));
+    CUDA_CHECK(cudaFree(d_alpha_bar)); CUDA_CHECK(cudaFree(d_sqrt_ab));
+    CUDA_CHECK(cudaFree(d_sqrt_1mab));
 }
 
 // =============================================================================
@@ -229,16 +229,16 @@ __global__ void kernel_mse_reduce(
 float cuda_mse_loss(const float* d_pred, const float* d_target,
     float* d_loss, int N, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_loss, 0, sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
     int total   = N * 3;
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
     kernel_mse_reduce<<<blocks, threads, threads * sizeof(float), stream>>>(
         d_pred, d_target, d_loss, total);
+    CUDA_CHECK(cudaGetLastError());
     float h_loss = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
-        cudaMemcpyDeviceToHost, stream));
-    cudaStreamSynchronize(stream);
+    CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float),
+        cudaMemcpyDeviceToHost));
     return h_loss;
 }
 
@@ -273,15 +273,15 @@ __global__ void kernel_cross_entropy(
 float cuda_cross_entropy(const float* d_logits, const int* d_labels,
     float* d_loss, int N, int C, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_loss, 0, sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_loss, 0, sizeof(float)));
     int threads = 256;
     int blocks  = (N + threads - 1) / threads;
     kernel_cross_entropy<<<blocks, threads, threads * sizeof(float), stream>>>(
         d_logits, d_labels, d_loss, N, C);
+    CUDA_CHECK(cudaGetLastError());
     float h_loss = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_loss, d_loss, sizeof(float),
-        cudaMemcpyDeviceToHost, stream));
-    cudaStreamSynchronize(stream);
+    CUDA_CHECK(cudaMemcpy(&h_loss, d_loss, sizeof(float),
+        cudaMemcpyDeviceToHost));
     return h_loss;
 }
 
@@ -447,7 +447,7 @@ void cuda_build_radius_graph(
     int* d_edge_src, int* d_edge_dst, int* d_n_edges,
     float radius, int N_total, int max_edges, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_n_edges, 0, sizeof(int), stream));
+    CUDA_CHECK(cudaMemset(d_n_edges, 0, sizeof(int)));
     int threads = 256;
     int blocks  = (N_total + threads - 1) / threads;
     kernel_build_radius_graph<<<blocks, threads, 0, stream>>>(
@@ -523,7 +523,7 @@ void cuda_scatter_add(
     const float* d_msg, const int* d_dst, float* d_agg,
     int E, int D, int N, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemsetAsync(d_agg, 0, (size_t)N * D * sizeof(float), stream));
+    CUDA_CHECK(cudaMemset(d_agg, 0, (size_t)N * D * sizeof(float)));
     int threads = 256;
     int blocks  = (E + threads - 1) / threads;
     kernel_scatter_add<<<blocks, threads, 0, stream>>>(d_msg, d_dst, d_agg, E, D);
@@ -712,9 +712,9 @@ void cuda_fps(const float* d_xyz, int* d_fps_idx, float* d_dist_buf,
     // iteration could race with the tail of the previous iteration's kernels.
     // Using synchronous memset here makes the initialization order explicit and
     // removes the hazard entirely.
-    CUDA_CHECK(cudaMemset(d_dist_buf, 0x7f, (size_t)N * sizeof(float)));
-    // 0x7f repeated fills every byte → each float becomes 0x7f7f7f7f ≈ 3.4e38,
-    // which is less than FLT_MAX (0x7f7fffff ≈ 3.4e38) but large enough.
+    // Use 0x00 to initialize to 0.0f, then the first distance update will set
+    // proper values. Alternatively, use a kernel to fill with FLT_MAX.
+    CUDA_CHECK(cudaMemset(d_dist_buf, 0, (size_t)N * sizeof(float)));
 
     // Per-block argmax results — kept in device and pinned host memory.
     int* d_block_max = nullptr;
@@ -728,8 +728,8 @@ void cuda_fps(const float* d_xyz, int* d_fps_idx, float* d_dist_buf,
     for (int s = 0; s < n_sample; ++s) {
         // Write d_fps_idx[s] = farthest (after the stream is idle).
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_fps_idx + s, &farthest, sizeof(int),
-            cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpy(d_fps_idx + s, &farthest, sizeof(int),
+            cudaMemcpyHostToDevice));
 
         // Update running min-distances from the newly selected point.
         kernel_fps_update_dist<<<BLOCKS, THREADS, 0, stream>>>(
@@ -744,9 +744,9 @@ void cuda_fps(const float* d_xyz, int* d_fps_idx, float* d_dist_buf,
         CUDA_CHECK_LAST();
 
         // Copy all block winners to pinned host memory in one DtoH transfer.
-        CUDA_CHECK(cudaMemcpyAsync(h_block_max, d_block_max,
+        CUDA_CHECK(cudaMemcpy(h_block_max, d_block_max,
             (size_t)BLOCKS * sizeof(int),
-            cudaMemcpyDeviceToHost, stream));
+            cudaMemcpyDeviceToHost));
 
         // Wait for both kernels and the DtoH copy to finish.
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -975,10 +975,10 @@ void EGNNLayerWeights::allocate(int feat, int time_dim_)
 
 void EGNNLayerWeights::free()
 {
-    cudaFree(W_e); cudaFree(b_e);
-    cudaFree(W_h); cudaFree(b_h);
-    cudaFree(W_x); cudaFree(b_x);
-    cudaFree(gamma); cudaFree(beta_ln);
+    CUDA_CHECK(cudaFree(W_e)); CUDA_CHECK(cudaFree(b_e));
+    CUDA_CHECK(cudaFree(W_h)); CUDA_CHECK(cudaFree(b_h));
+    CUDA_CHECK(cudaFree(W_x)); CUDA_CHECK(cudaFree(b_x));
+    CUDA_CHECK(cudaFree(gamma)); CUDA_CHECK(cudaFree(beta_ln));
 }
 
 void EGNNLayerWeights::xavier_init(unsigned seed)
@@ -1007,11 +1007,11 @@ void PointNetWeights::allocate(int cond_dim)
 
 void PointNetWeights::free()
 {
-    cudaFree(W_sa1); cudaFree(b_sa1);
-    cudaFree(W_sa2); cudaFree(b_sa2);
-    cudaFree(W_sa3); cudaFree(b_sa3);
-    cudaFree(W_fc1); cudaFree(b_fc1);
-    cudaFree(W_fc2); cudaFree(b_fc2);
+    CUDA_CHECK(cudaFree(W_sa1)); CUDA_CHECK(cudaFree(b_sa1));
+    CUDA_CHECK(cudaFree(W_sa2)); CUDA_CHECK(cudaFree(b_sa2));
+    CUDA_CHECK(cudaFree(W_sa3)); CUDA_CHECK(cudaFree(b_sa3));
+    CUDA_CHECK(cudaFree(W_fc1)); CUDA_CHECK(cudaFree(b_fc1));
+    CUDA_CHECK(cudaFree(W_fc2)); CUDA_CHECK(cudaFree(b_fc2));
 }
 
 void PointNetWeights::xavier_init(unsigned seed)
@@ -1039,10 +1039,10 @@ void HeadWeights::allocate(int D, int C)
 
 void HeadWeights::free()
 {
-    cudaFree(W_p1); cudaFree(b_p1);
-    cudaFree(W_p2); cudaFree(b_p2);
-    cudaFree(W_t1); cudaFree(b_t1);
-    cudaFree(W_t2); cudaFree(b_t2);
+    CUDA_CHECK(cudaFree(W_p1)); CUDA_CHECK(cudaFree(b_p1));
+    CUDA_CHECK(cudaFree(W_p2)); CUDA_CHECK(cudaFree(b_p2));
+    CUDA_CHECK(cudaFree(W_t1)); CUDA_CHECK(cudaFree(b_t1));
+    CUDA_CHECK(cudaFree(W_t2)); CUDA_CHECK(cudaFree(b_t2));
 }
 
 void HeadWeights::xavier_init(unsigned /*seed*/) { /* zero-init is fine for heads */ }
@@ -1063,11 +1063,11 @@ void MolDiffusion::Scratch::ensure(int N_tot, int B, int N_pc,
     allocated_E = max_edges;
 
     auto alloc = [](float*& p, size_t n) {
-        void* tmp = nullptr; cudaMalloc(&tmp, n * sizeof(float));
+        void* tmp = nullptr; CUDA_CHECK(cudaMalloc(&tmp, n * sizeof(float)));
         p = static_cast<float*>(tmp);
     };
     auto alloci = [](int*& p, size_t n) {
-        void* tmp = nullptr; cudaMalloc(&tmp, n * sizeof(int));
+        void* tmp = nullptr; CUDA_CHECK(cudaMalloc(&tmp, n * sizeof(int)));
         p = static_cast<int*>(tmp);
     };
 
@@ -1120,8 +1120,8 @@ void MolDiffusion::Scratch::ensure(int N_tot, int B, int N_pc,
 
 void MolDiffusion::Scratch::free_all()
 {
-    auto f  = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
-    auto fi = [](int*& p)  { if (p) { cudaFree(p); p = nullptr; } };
+    auto f  = [](auto*& p) { if (p) { CUDA_CHECK(cudaFree(p)); p = nullptr; } };
+    auto fi = [](int*& p)  { if (p) { CUDA_CHECK(cudaFree(p)); p = nullptr; } };
 
     f(d_pc); f(d_cent1); f(d_feat1); f(d_cent2); f(d_feat2);
     f(d_feat3); f(d_cond); f(d_fps_dist); f(d_fc_tmp);
@@ -1285,14 +1285,14 @@ void MolDiffusion::upload_molecules(const std::vector<Molecule>& mols,
         std::fill(h_batch.begin() + base, h_batch.begin() + offsets[b + 1], b);
     }
 
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_pos,   h_pos.data(),
-        N_tot * 3 * sizeof(float),   cudaMemcpyHostToDevice, stream_));
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_types, h_types.data(),
-        N_tot * sizeof(int32_t),     cudaMemcpyHostToDevice, stream_));
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_batch, h_batch.data(),
-        N_tot * sizeof(int32_t),     cudaMemcpyHostToDevice, stream_));
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_mol_off, offsets.data(),
-        (B + 1) * sizeof(int32_t),   cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_pos,   h_pos.data(),
+        N_tot * 3 * sizeof(float),   cudaMemcpyHostToDevice));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_types, h_types.data(),
+        N_tot * sizeof(int32_t),     cudaMemcpyHostToDevice));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_batch, h_batch.data(),
+        N_tot * sizeof(int32_t),     cudaMemcpyHostToDevice));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_mol_off, offsets.data(),
+        (B + 1) * sizeof(int32_t),   cudaMemcpyHostToDevice));
 }
 
 // =============================================================================
@@ -1313,8 +1313,8 @@ void MolDiffusion::encode_pc(const std::vector<PointCloud>& pcs)
         int          sz  = std::min((int)pcs[b].N, N_pc) * 3;
         std::copy(src, src + sz, dst);
     }
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_pc, h_pc.data(),
-        B * N_pc * 3 * sizeof(float), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_pc, h_pc.data(),
+        B * N_pc * 3 * sizeof(float), cudaMemcpyHostToDevice));
 
     // ── Set abstraction level 1: N_pc → 512, radius=0.2, K=32, out=128 ──────
     for (int b = 0; b < B; ++b) {
@@ -1416,9 +1416,8 @@ void MolDiffusion::run_denoiser(int N_tot, int B, const int* d_batch_offsets)
         cfg_.radius, N_tot, max_E, stream_);
 
     int n_edges_h = 0;
-    cudaMemcpyAsync(&n_edges_h, scratch_.d_n_edges, sizeof(int),
-        cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
+    CUDA_CHECK(cudaMemcpy(&n_edges_h, scratch_.d_n_edges, sizeof(int),
+        cudaMemcpyDeviceToHost));
 
     // 4. EGNN layers
     for (int l = 0; l < cfg_.n_layers; ++l) {
@@ -1475,8 +1474,8 @@ std::tuple<float, float, float> MolDiffusion::compute_loss(
 
     std::vector<int> offsets;
     upload_molecules(mols, offsets);
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_mol_off, offsets.data(),
-        (B + 1) * sizeof(int), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_mol_off, offsets.data(),
+        (B + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
     // Sample random timesteps (one per molecule, broadcast to atoms)
     std::mt19937 rng(std::random_device{}());
@@ -1487,8 +1486,8 @@ std::tuple<float, float, float> MolDiffusion::compute_loss(
         for (int i = offsets[b]; i < offsets[b + 1]; ++i)
             h_t_atom[i] = t;
     }
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_t_atom, h_t_atom.data(),
-        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_t_atom, h_t_atom.data(),
+        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     // q_sample: add noise
     cuda_q_sample_positions(
@@ -1535,10 +1534,10 @@ std::vector<Molecule> MolDiffusion::sample(
         offsets[b + 1] = offsets[b] + n_atoms;
         for (int i = offsets[b]; i < offsets[b + 1]; ++i) h_batch[i] = b;
     }
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_batch, h_batch.data(),
-        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_mol_off, offsets.data(),
-        (B + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_batch, h_batch.data(),
+        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_mol_off, offsets.data(),
+        (B + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     // Initialize positions from pure noise
     cuda_q_sample_positions(
@@ -1552,8 +1551,8 @@ std::vector<Molecule> MolDiffusion::sample(
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> type_dist(0, cfg_.n_atom_types - 1);
     for (auto& t : h_types) t = type_dist(rng);
-    CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_types_t, h_types.data(),
-        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK2(cudaMemcpy(scratch_.d_types_t, h_types.data(),
+        N_tot * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     // Encode point clouds once before the reverse loop
     encode_pc(pcs);
@@ -1561,8 +1560,8 @@ std::vector<Molecule> MolDiffusion::sample(
     // DDPM reverse loop
     for (int step = cfg_.n_timesteps - 1; step >= 0; --step) {
         std::vector<int32_t> h_t(N_tot, step);
-        CUDA_CHECK2(cudaMemcpyAsync(scratch_.d_t_atom, h_t.data(),
-            N_tot * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK2(cudaMemcpy(scratch_.d_t_atom, h_t.data(),
+            N_tot * sizeof(int32_t), cudaMemcpyHostToDevice));
 
         run_denoiser(N_tot, B, scratch_.d_mol_off);
 
@@ -1607,7 +1606,7 @@ void MolDiffusion::save(const std::string& path) const
 
     auto write_tensor = [&](const float* d, size_t n) {
         std::vector<float> h(n);
-        cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost));
         ofs.write(reinterpret_cast<const char*>(h.data()), n * sizeof(float));
     };
 
@@ -1653,7 +1652,7 @@ void MolDiffusion::load(const std::string& path)
     auto read_tensor = [&](float* d, size_t n) {
         std::vector<float> h(n);
         ifs.read(reinterpret_cast<char*>(h.data()), n * sizeof(float));
-        cudaMemcpy(d, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
     };
 
     read_tensor(pn_weights_.W_sa1, 3   * 128);
