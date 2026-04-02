@@ -1,5 +1,5 @@
 ```
-# Compiled and binary files
+*.pyc
 *.o
 *.obj
 *.exe
@@ -7,44 +7,48 @@
 *.so
 *.a
 *.out
-
-# CUDA related
-*.cu.o
-*.ptx
-
-# Dependencies
-venv/
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Build artifacts
-build/
 dist/
-*.egg-info/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Coverage
+build/
+target/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
 .coverage
 coverage/
 htmlcov/
-
-# OS specific
+node_modules/
+.venv/
+venv/
+.env
+.env.local
+.env.*
 .DS_Store
 Thumbs.db
+*.log
+*.tmp
+*.swp
+.vscode/
+.idea/
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
