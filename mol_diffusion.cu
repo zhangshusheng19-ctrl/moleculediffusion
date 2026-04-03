@@ -46,12 +46,15 @@ __global__ void kernel_build_cosine_schedule(
     float ab_t   = diff_alpha_bar(t,     T);
     float ab_tm1 = (t > 0) ? diff_alpha_bar(t - 1, T) : 1.f;
 
-    float beta    = fminf(1.f - ab_t / (ab_tm1 + 1e-8f), 0.999f);
+    float ratio = ab_t / (ab_tm1 + 1e-8f);
+    ratio = fminf(ratio, 1.f);  // prevent ab_t > ab_tm1 due to numerical errors
+    float beta    = fminf(1.f - ratio, 0.999f);
+    beta = fmaxf(beta, 0.f);     // ensure non-negative
     betas[t]      = beta;
     alphas[t]     = 1.f - beta;
     alpha_bar[t]  = ab_t;
-    sqrt_ab[t]    = sqrtf(ab_t);
-    sqrt_1mab[t]  = sqrtf(1.f - ab_t);
+    sqrt_ab[t]    = sqrtf(fmaxf(ab_t, 0.f));
+    sqrt_1mab[t]  = sqrtf(fmaxf(1.f - ab_t, 0.f));
 }
 
 void NoiseSchedule::allocate(int timesteps, float /*beta_start*/, float /*beta_end*/,
