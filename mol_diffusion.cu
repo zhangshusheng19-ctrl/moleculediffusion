@@ -1,5 +1,5 @@
 
-#include "mol_diffusion6.h"
+#include "mol_diffusion.h"
 
 // =============================================================================
 //  SECTION 1: Noise schedule  (cosine schedule — from diff.cu §DIFF-K1)
