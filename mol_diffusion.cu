@@ -1686,16 +1686,26 @@ void diff_forward(cublasHandle_t handle, DiffusionModule& m,
     int blk = (n + blk_size - 1) / blk_size;
 
     // Step 1 — noise injection
+    //if (m.training) {
+    //    int pair_blk = (n / 2 + blk_size - 1) / blk_size;
+    //    diff_fill_noise_kernel << <pair_blk, blk_size >> > (
+    //        m.noise.data, m.noise_seed, DIFF_NOISE_SCALE, n);
+    //    m.noise_seed += 7919u;
+    //    diff_forward_noise_kernel << <blk, blk_size >> > (
+    //        X_in.data, m.noise.data, m.x_noisy.data,
+   //         m.sqrt_ab, m.sqrt_1mab, n);
+   // }
+   // else {
+   //     cudaMemcpy(m.x_noisy.data, X_in.data, n * sizeof(float),
+   //         cudaMemcpyDeviceToDevice);
+   // }
     if (m.training) {
-        int pair_blk = (n / 2 + blk_size - 1) / blk_size;
-        diff_fill_noise_kernel << <pair_blk, blk_size >> > (
-            m.noise.data, m.noise_seed, DIFF_NOISE_SCALE, n);
-        m.noise_seed += 7919u;
-        diff_forward_noise_kernel << <blk, blk_size >> > (
-            X_in.data, m.noise.data, m.x_noisy.data,
-            m.sqrt_ab, m.sqrt_1mab, n);
+        // Training mode: directly copy input to x_noisy without adding extra noise
+        cudaMemcpy(m.x_noisy.data, X_in.data, n * sizeof(float),
+            cudaMemcpyDeviceToDevice);
     }
     else {
+        // Inference mode: clean copy (same as training now)
         cudaMemcpy(m.x_noisy.data, X_in.data, n * sizeof(float),
             cudaMemcpyDeviceToDevice);
     }
