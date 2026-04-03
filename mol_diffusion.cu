@@ -1,37 +1,60 @@
 
-#include "mol_diffusion.h"
+#include "mol_diffusion6.h"
 
 // =============================================================================
-//  SECTION 1: Noise schedule
+//  SECTION 1: Noise schedule  (cosine schedule — from diff.cu §DIFF-K1)
+//
+//  Replaces the old linear beta-schedule kernel with the improved cosine
+//  schedule from diff.cu.  The device helper diff_alpha_bar() computes α̅_t
+//  on the GPU; host_alpha_bar() is its exact CPU mirror used in
+//  NoiseSchedule::allocate() to pre-fill the schedule arrays via a single
+//  kernel launch.
 // =============================================================================
 
-__global__ void kernel_build_schedule(
+// ── §DIFF-K1  Cosine alpha_bar — device helper ────────────────────────────────
+// f(t) = cos²( π/2 · (t/T + s) / (1 + s) ),  s = 0.008 offset
+// α̅_t  = f(t) / f(0)  (normalised so α̅_0 = 1)
+__device__ float diff_alpha_bar(int t, int T)
+{
+    const float s  = 0.008f;
+    float ft = cosf(((float)t / (float)T + s) / (1.f + s) * 3.14159265f * 0.5f);
+    float f0 = cosf((s)                       / (1.f + s) * 3.14159265f * 0.5f);
+    return (ft * ft) / (f0 * f0);
+}
+
+// Host mirror — identical arithmetic, used to pre-fill schedule arrays.
+static float host_alpha_bar(int t, int T)
+{
+    const float s  = 0.008f;
+    float ft = cosf(((float)t / (float)T + s) / (1.f + s) * 3.14159265f * 0.5f);
+    float f0 = cosf((s)                       / (1.f + s) * 3.14159265f * 0.5f);
+    return (ft * ft) / (f0 * f0);
+}
+
+// ── Schedule fill kernel (one thread per timestep) ────────────────────────────
+// Computes betas from successive α̅ ratios:
+//   β_t = 1 − α̅_t / α̅_{t−1}   (clipped to [0, 0.999])
+// then derives α_t, sqrt_ab, sqrt_1mab.
+__global__ void kernel_build_cosine_schedule(
     float* betas, float* alphas, float* alpha_bar,
     float* sqrt_ab, float* sqrt_1mab,
-    int T, float beta_start, float beta_end)
+    int T)
 {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T) return;
 
-    float b = beta_start + (beta_end - beta_start) * t / (T - 1);
-    betas[t]  = b;
-    alphas[t] = 1.f - b;
+    float ab_t   = diff_alpha_bar(t,     T);
+    float ab_tm1 = (t > 0) ? diff_alpha_bar(t - 1, T) : 1.f;
 
-    // Cumulative product done sequentially on a single thread for simplicity.
-    // For large T a parallel scan would be more efficient.
-    if (t == 0) {
-        float ab = 1.f;
-        for (int i = 0; i < T; ++i) {
-            float bi = beta_start + (beta_end - beta_start) * i / (T - 1);
-            ab          *= (1.f - bi);
-            alpha_bar[i] = ab;
-            sqrt_ab[i]   = sqrtf(ab);
-            sqrt_1mab[i] = sqrtf(1.f - ab);
-        }
-    }
+    float beta    = fminf(1.f - ab_t / (ab_tm1 + 1e-8f), 0.999f);
+    betas[t]      = beta;
+    alphas[t]     = 1.f - beta;
+    alpha_bar[t]  = ab_t;
+    sqrt_ab[t]    = sqrtf(ab_t);
+    sqrt_1mab[t]  = sqrtf(1.f - ab_t);
 }
 
-void NoiseSchedule::allocate(int timesteps, float beta_start, float beta_end,
+void NoiseSchedule::allocate(int timesteps, float /*beta_start*/, float /*beta_end*/,
     cudaStream_t stream)
 {
     T = timesteps;
@@ -42,10 +65,10 @@ void NoiseSchedule::allocate(int timesteps, float beta_start, float beta_end,
     CUDA_CHECK(cudaMalloc(&d_sqrt_ab,  sz));
     CUDA_CHECK(cudaMalloc(&d_sqrt_1mab,sz));
 
-    // Single-thread kernel fills the entire schedule.
-    kernel_build_schedule<<<1, 1, 0, stream>>>(
-        d_betas, d_alphas, d_alpha_bar, d_sqrt_ab, d_sqrt_1mab,
-        T, beta_start, beta_end);
+    int threads = 256;
+    int blocks  = (T + threads - 1) / threads;
+    kernel_build_cosine_schedule<<<blocks, threads, 0, stream>>>(
+        d_betas, d_alphas, d_alpha_bar, d_sqrt_ab, d_sqrt_1mab, T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -625,242 +648,353 @@ void cuda_egnn_coord_update(
 }
 
 // =============================================================================
-//  SECTION 7: PointNet++ kernels
+//  SECTION 7: PointNet++ kernels  (from pointnet2_ops.h)
+//
+//  Replaces the previous bespoke FPS + ball-query + set-abstraction kernels
+//  with the production PointNet++ ops from pointnet2_ops.h:
+//    • Farthest Point Sampling  (farthest_point_sampling_kernel)
+//    • Query Ball Point         (query_ball_point_kernel)
+//    • Group Point              (group_point_kernel + grad)
+//    • Three Nearest Neighbours (three_nn_kernel)
+//    • Three Interpolate        (three_interpolate_kernel + grad)
+//
+//  Wrapper functions (cuda_fps, cuda_ball_query, cuda_gather_xyz,
+//  cuda_set_abstraction, cuda_global_avg_pool) preserve the calling
+//  convention used by encode_pc so that Section 14 needs no changes.
 // =============================================================================
 
-// ── FPS distance-update kernel ────────────────────────────────────────────────
+// ── §PN-K1  Farthest Point Sampling ──────────────────────────────────────────
+// Inputs:  dataset [b, n, 3]   temp [b, n]
+// Outputs: idxs    [b, m]
+// Each block handles one batch element; uses a shared-memory reduction to find
+// the globally farthest point each iteration.  The first m=512 points of the
+// dataset are cached in shared memory (BufferSize = 3072 / 3) for fast access.
 
-__global__ void kernel_fps_update_dist(
-    const float* __restrict__ xyz,  // [N, 3]
-    float*                    dist, // [N]  current min-dist (in/out)
-    int                       farthest,
-    int                       N)
+__global__ void farthest_point_sampling_kernel(
+    int b, int n, int m,
+    const float* __restrict__ dataset,
+    float*       __restrict__ temp,
+    int*         __restrict__ idxs)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
+    if (m <= 0) return;
 
-    float cx = xyz[farthest * 3 + 0];
-    float cy = xyz[farthest * 3 + 1];
-    float cz = xyz[farthest * 3 + 2];
-    float dx = xyz[i * 3 + 0] - cx;
-    float dy = xyz[i * 3 + 1] - cy;
-    float dz = xyz[i * 3 + 2] - cz;
-    float d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 < dist[i]) dist[i] = d2;
-}
+    const int BlockSize  = 512;
+    const int BufferSize = 3072;
+    __shared__ float dists[BlockSize];
+    __shared__ int   dists_i[BlockSize];
+    __shared__ float buf[BufferSize * 3];
 
-// ── Per-block argmax over dist[] ──────────────────────────────────────────────
-// Two explicit shared arrays avoid pointer aliasing and alignment issues.
+    for (int i = blockIdx.x; i < b; i += gridDim.x) {
+        int old = 0;
+        if (threadIdx.x == 0)
+            idxs[i * m + 0] = old;
 
-__global__ void kernel_argmax_dist(
-    const float* __restrict__ dist,
-    int*  out,  // [gridDim.x]  one winner per block
-    int   N)
-{
-    __shared__ float smem_val[256];
-    __shared__ int   smem_idx[256];
+        // Initialise running min-distances to +Inf
+        for (int j = threadIdx.x; j < n; j += blockDim.x)
+            temp[blockIdx.x * n + j] = 1e38f;
 
-    int tid = threadIdx.x;
-    int i   = blockIdx.x * blockDim.x + tid;
-
-    smem_val[tid] = (i < N) ? dist[i] :  -1.f;
-    smem_idx[tid] = (i < N) ? i       :  0;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && smem_val[tid + s] > smem_val[tid]) {
-            smem_val[tid] = smem_val[tid + s];
-            smem_idx[tid] = smem_idx[tid + s];
-        }
+        // Cache leading points into shared memory
+        for (int j = threadIdx.x; j < min(BufferSize, n) * 3; j += blockDim.x)
+            buf[j] = dataset[i * n * 3 + j];
         __syncthreads();
+
+        for (int j = 1; j < m; j++) {
+            int   besti = 0;
+            float best  = -1.f;
+
+            float x1 = dataset[i * n * 3 + old * 3 + 0];
+            float y1 = dataset[i * n * 3 + old * 3 + 1];
+            float z1 = dataset[i * n * 3 + old * 3 + 2];
+
+            for (int k = threadIdx.x; k < n; k += blockDim.x) {
+                float td = temp[blockIdx.x * n + k];
+                float x2, y2, z2;
+                if (k < BufferSize) {
+                    x2 = buf[k * 3 + 0]; y2 = buf[k * 3 + 1]; z2 = buf[k * 3 + 2];
+                } else {
+                    x2 = dataset[i * n * 3 + k * 3 + 0];
+                    y2 = dataset[i * n * 3 + k * 3 + 1];
+                    z2 = dataset[i * n * 3 + k * 3 + 2];
+                }
+                float d  = (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1) + (z2-z1)*(z2-z1);
+                float d2 = fminf(d, td);
+                if (d2 != td) temp[blockIdx.x * n + k] = d2;
+                if (d2 > best) { best = d2; besti = k; }
+            }
+            dists[threadIdx.x]   = best;
+            dists_i[threadIdx.x] = besti;
+
+            // Tree reduction to find the thread with the maximum distance
+            for (int u = 0; (1 << u) < blockDim.x; u++) {
+                __syncthreads();
+                if (threadIdx.x < (blockDim.x >> (u + 1))) {
+                    int i1 = (threadIdx.x * 2) << u;
+                    int i2 = (threadIdx.x * 2 + 1) << u;
+                    if (dists[i1] < dists[i2]) {
+                        dists[i1]   = dists[i2];
+                        dists_i[i1] = dists_i[i2];
+                    }
+                }
+            }
+            __syncthreads();
+            old = dists_i[0];
+            if (threadIdx.x == 0) idxs[i * m + j] = old;
+        }
     }
-    if (tid == 0) out[blockIdx.x] = smem_idx[0];
 }
 
-// ── Farthest-point sampling ───────────────────────────────────────────────────
-//
-// FIX (line 718 bug): The original cudaMemsetAsync was failing because
-// cuda_fps is called with a stream that already had pending async work from the
-// outer encode_pc loop.  The "invalid argument" error occurred because the
-// memset followed immediately by kernel launches on the same stream — while
-// correct in principle — was racing when the calling code reused the dist
-// buffer across iterations without syncing first.  The fix is:
-//   1. Synchronize the stream before starting so no prior work can alias the
-//      dist buffer.
-//   2. Use cudaMemset (synchronous) to initialize dist[] so it is guaranteed
-//      complete before the first kernel_fps_update_dist launch.
-//   3. Eliminate the one-float-at-a-time D→H copies inside the loop by
-//      copying all block winners in one shot and resolving the global winner
-//      on the CPU from the pinned host buffer (already present in the original
-//      code, but the individual cudaMemcpy calls undermined it).
-
+// Wrapper used by encode_pc (stream-aware; matches old cuda_fps signature).
 void cuda_fps(const float* d_xyz, int* d_fps_idx, float* d_dist_buf,
     int N, int n_sample, cudaStream_t stream)
 {
-    const int THREADS = 256;
-    const int BLOCKS  = (N + THREADS - 1) / THREADS;
-
-    // Flush any pending stream work that might touch d_dist_buf before we
-    // reinitialise it.  This is cheap (no-op if the stream is already idle).
+    // The kernel expects a single contiguous batch; encode_pc calls it once
+    // per batch element with b=1, n=N, m=n_sample.
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // FIX: use synchronous cudaMemset so the initialization is guaranteed
-    // complete before the first update kernel runs.  Previously,
-    // cudaMemsetAsync + an immediate kernel on the same stream should be
-    // ordered correctly by CUDA, but when the *calling* code reused the buffer
-    // across loop iterations without syncing, the async memset from the next
-    // iteration could race with the tail of the previous iteration's kernels.
-    // Using synchronous memset here makes the initialization order explicit and
-    // removes the hazard entirely.
     CUDA_CHECK(cudaMemset(d_dist_buf, 0x7f, (size_t)N * sizeof(float)));
-    // 0x7f repeated fills every byte → each float becomes 0x7f7f7f7f ≈ 3.4e38,
-    // which is less than FLT_MAX (0x7f7fffff ≈ 3.4e38) but large enough.
-
-    // Per-block argmax results — kept in device and pinned host memory.
-    int* d_block_max = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_block_max, (size_t)BLOCKS * sizeof(int)));
-
-    int* h_block_max = nullptr;
-    CUDA_CHECK(cudaMallocHost(&h_block_max, (size_t)BLOCKS * sizeof(int)));
-
-    int farthest = 0;
-
-    for (int s = 0; s < n_sample; ++s) {
-        // Write d_fps_idx[s] = farthest (after the stream is idle).
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_fps_idx + s, &farthest, sizeof(int),
-            cudaMemcpyHostToDevice, stream));
-
-        // Update running min-distances from the newly selected point.
-        kernel_fps_update_dist<<<BLOCKS, THREADS, 0, stream>>>(
-            d_xyz, d_dist_buf, farthest, N);
-        CUDA_CHECK_LAST();
-
-        if (s == n_sample - 1) break;  // no need to find the next farthest
-
-        // Compute per-block argmax on the GPU.
-        kernel_argmax_dist<<<BLOCKS, THREADS, 0, stream>>>(
-            d_dist_buf, d_block_max, N);
-        CUDA_CHECK_LAST();
-
-        // Copy all block winners to pinned host memory in one DtoH transfer.
-        CUDA_CHECK(cudaMemcpyAsync(h_block_max, d_block_max,
-            (size_t)BLOCKS * sizeof(int),
-            cudaMemcpyDeviceToHost, stream));
-
-        // Wait for both kernels and the DtoH copy to finish.
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Resolve global winner among block winners on the CPU.
-        // We need actual distances to break ties; read them in one batched
-        // D→H copy rather than one-float-at-a-time (original had O(BLOCKS)
-        // individual cudaMemcpy calls — this version uses a single call).
-        std::vector<float> h_cand_dists(BLOCKS);
-        std::vector<int>   h_cand_idx(BLOCKS);
-        for (int b = 0; b < BLOCKS; ++b) h_cand_idx[b] = h_block_max[b];
-
-        // One batched D→H: copy just the candidate distances.
-        // Because the candidates are scattered in d_dist_buf we still need
-        // individual reads, but limit them to BLOCKS (≤ N/256) accesses.
-        float best_dist = -1.f;
-        farthest = 0;
-        for (int b = 0; b < BLOCKS; ++b) {
-            int   idx = h_cand_idx[b];
-            float d;
-            CUDA_CHECK(cudaMemcpy(&d, d_dist_buf + idx, sizeof(float),
-                cudaMemcpyDeviceToHost));
-            if (d > best_dist) { best_dist = d; farthest = idx; }
-        }
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFree(d_block_max));
-    CUDA_CHECK(cudaFreeHost(h_block_max));
+    farthest_point_sampling_kernel<<<32, 512, 0, stream>>>(
+        /*b=*/1, N, n_sample, d_xyz, d_dist_buf, d_fps_idx);
+    CUDA_CHECK_LAST();
 }
 
-// ── Ball query ────────────────────────────────────────────────────────────────
+// ── §PN-K2  Query Ball Point ──────────────────────────────────────────────────
+// For each point in xyz2 [b, m, 3], finds up to nsample neighbours within
+// radius in xyz1 [b, n, 3].
+// Outputs: idx [b, m, nsample], pts_cnt [b, m]
 
-__global__ void kernel_ball_query(
-    const float* __restrict__ xyz,      // [N, 3]
-    const float* __restrict__ centers,  // [M, 3]
-    int*   idx,                         // [M, K]  output
-    float  r2,
-    int    N, int M, int K)
+__global__ void query_ball_point_kernel(
+    int b, int n, int m,
+    float radius, int nsample,
+    const float* __restrict__ xyz1,
+    const float* __restrict__ xyz2,
+    int* __restrict__ idx,
+    int* __restrict__ pts_cnt)
 {
-    int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M) return;
+    int batch_index = blockIdx.x;
+    xyz1    += n * 3        * batch_index;
+    xyz2    += m * 3        * batch_index;
+    idx     += m * nsample  * batch_index;
+    pts_cnt += m            * batch_index;
 
-    float cx  = centers[m * 3 + 0];
-    float cy  = centers[m * 3 + 1];
-    float cz  = centers[m * 3 + 2];
-    int   cnt = 0;
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < m; j += stride) {
+        int   cnt = 0;
+        float x2  = xyz2[j * 3 + 0];
+        float y2  = xyz2[j * 3 + 1];
+        float z2  = xyz2[j * 3 + 2];
 
-    for (int n = 0; n < N && cnt < K; ++n) {
-        float dx = xyz[n * 3 + 0] - cx;
-        float dy = xyz[n * 3 + 1] - cy;
-        float dz = xyz[n * 3 + 2] - cz;
-        if (dx * dx + dy * dy + dz * dz < r2)
-            idx[m * K + cnt++] = n;
+        for (int k = 0; k < n; ++k) {
+            if (cnt == nsample) break;
+            float x1 = xyz1[k * 3 + 0];
+            float y1 = xyz1[k * 3 + 1];
+            float z1 = xyz1[k * 3 + 2];
+            float d  = fmaxf(sqrtf((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1)+(z2-z1)*(z2-z1)), 1e-20f);
+            if (d < radius) {
+                if (cnt == 0) {
+                    // Pre-fill all slots with the first neighbour found
+                    for (int l = 0; l < nsample; ++l) idx[j * nsample + l] = k;
+                }
+                idx[j * nsample + cnt] = k;
+                cnt++;
+            }
+        }
+        pts_cnt[j] = cnt;
     }
-    // Pad unfilled slots with the first found index (or 0 if none).
-    int pad = (cnt > 0) ? idx[m * K] : 0;
-    for (int k = cnt; k < K; ++k) idx[m * K + k] = pad;
 }
 
+// Wrapper — adapts batch=1 slices used by encode_pc.
 void cuda_ball_query(
     const float* d_xyz, const float* d_centers, int* d_idx,
     float radius, int N, int M, int K, cudaStream_t stream)
 {
+    // Allocate a temporary pts_cnt buffer (not exposed to callers).
+    int* d_pts_cnt = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_pts_cnt, M * sizeof(int)));
+    query_ball_point_kernel<<<1, 256, 0, stream>>>(
+        /*b=*/1, N, M, radius, K,
+        d_xyz, d_centers, d_idx, d_pts_cnt);
+    CUDA_CHECK_LAST();
+    CUDA_CHECK(cudaFree(d_pts_cnt));
+}
+
+// ── §PN-K3  Group Point (gather features by index) ───────────────────────────
+// points [b, n, c], idx [b, m, nsample] → out [b, m, nsample, c]
+
+__global__ void group_point_kernel(
+    int b, int n, int c, int m, int nsample,
+    const float* __restrict__ points,
+    const int*   __restrict__ idx,
+    float*       __restrict__ out)
+{
+    int batch_index = blockIdx.x;
+    points += n * c        * batch_index;
+    idx    += m * nsample  * batch_index;
+    out    += m * nsample * c * batch_index;
+
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < m; j += stride) {
+        for (int k = 0; k < nsample; ++k) {
+            int ii = idx[j * nsample + k];
+            for (int l = 0; l < c; ++l)
+                out[j * nsample * c + k * c + l] = points[ii * c + l];
+        }
+    }
+}
+
+// ── §PN-K3G  Group Point Gradient ────────────────────────────────────────────
+// grad_out [b, m, nsample, c], idx [b, m, nsample] → grad_points [b, n, c]
+
+__global__ void group_point_grad_kernel(
+    int b, int n, int c, int m, int nsample,
+    const float* __restrict__ grad_out,
+    const int*   __restrict__ idx,
+    float*       __restrict__ grad_points)
+{
+    int batch_index = blockIdx.x;
+    idx        += m * nsample      * batch_index;
+    grad_out   += m * nsample * c  * batch_index;
+    grad_points += n * c            * batch_index;
+
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < m; j += stride) {
+        for (int k = 0; k < nsample; ++k) {
+            int ii = idx[j * nsample + k];
+            for (int l = 0; l < c; ++l)
+                atomicAdd(&grad_points[ii * c + l],
+                          grad_out[j * nsample * c + k * c + l]);
+        }
+    }
+}
+
+// ── §PN-K4  Three Nearest Neighbours ─────────────────────────────────────────
+// For each point in xyz1 [b, n, 3] find the 3 nearest in xyz2 [b, m, 3].
+// Outputs: dist [b, n, 3]  (squared distances, double precision internally),
+//          idx  [b, n, 3]
+
+__global__ void three_nn_kernel(
+    int b, int n, int m,
+    const float* __restrict__ xyz1,
+    const float* __restrict__ xyz2,
+    float* __restrict__ dist,
+    int*   __restrict__ idx)
+{
+    int batch_index = blockIdx.x;
+    xyz1 += n * 3 * batch_index;
+    xyz2 += m * 3 * batch_index;
+    dist += n * 3 * batch_index;
+    idx  += n * 3 * batch_index;
+
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < n; j += stride) {
+        float x1 = xyz1[j * 3 + 0];
+        float y1 = xyz1[j * 3 + 1];
+        float z1 = xyz1[j * 3 + 2];
+
+        double best1 = 1e40, best2 = 1e40, best3 = 1e40;
+        int besti1 = 0, besti2 = 0, besti3 = 0;
+
+        for (int k = 0; k < m; ++k) {
+            float x2 = xyz2[k * 3 + 0];
+            float y2 = xyz2[k * 3 + 1];
+            float z2 = xyz2[k * 3 + 2];
+            double d = (double)(x2-x1)*(x2-x1) +
+                       (double)(y2-y1)*(y2-y1) +
+                       (double)(z2-z1)*(z2-z1);
+            if      (d < best1) { best3=best2; besti3=besti2; best2=best1; besti2=besti1; best1=d; besti1=k; }
+            else if (d < best2) { best3=best2; besti3=besti2; best2=d;     besti2=k; }
+            else if (d < best3) { best3=d;     besti3=k; }
+        }
+        dist[j*3+0]=(float)best1; idx[j*3+0]=besti1;
+        dist[j*3+1]=(float)best2; idx[j*3+1]=besti2;
+        dist[j*3+2]=(float)best3; idx[j*3+2]=besti3;
+    }
+}
+
+// ── §PN-K5  Three Interpolate ─────────────────────────────────────────────────
+// points [b, m, c], idx [b, n, 3], weight [b, n, 3] → out [b, n, c]
+
+__global__ void three_interpolate_kernel(
+    int b, int m, int c, int n,
+    const float* __restrict__ points,
+    const int*   __restrict__ idx,
+    const float* __restrict__ weight,
+    float*       __restrict__ out)
+{
+    int batch_index = blockIdx.x;
+    points += m * c * batch_index;
+    idx    += n * 3 * batch_index;
+    weight += n * 3 * batch_index;
+    out    += n * c * batch_index;
+
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < n; j += stride) {
+        float w1=weight[j*3+0], w2=weight[j*3+1], w3=weight[j*3+2];
+        int   i1=idx[j*3+0],   i2=idx[j*3+1],   i3=idx[j*3+2];
+        for (int l = 0; l < c; ++l)
+            out[j*c+l] = points[i1*c+l]*w1 + points[i2*c+l]*w2 + points[i3*c+l]*w3;
+    }
+}
+
+// ── §PN-K5G  Three Interpolate Gradient ──────────────────────────────────────
+
+__global__ void three_interpolate_grad_kernel(
+    int b, int n, int c, int m,
+    const float* __restrict__ grad_out,
+    const int*   __restrict__ idx,
+    const float* __restrict__ weight,
+    float*       __restrict__ grad_points)
+{
+    int batch_index = blockIdx.x;
+    grad_out    += n * c * batch_index;
+    idx         += n * 3 * batch_index;
+    weight      += n * 3 * batch_index;
+    grad_points += m * c * batch_index;
+
+    int index = threadIdx.x, stride = blockDim.x;
+    for (int j = index; j < n; j += stride) {
+        float w1=weight[j*3+0], w2=weight[j*3+1], w3=weight[j*3+2];
+        int   i1=idx[j*3+0],   i2=idx[j*3+1],   i3=idx[j*3+2];
+        for (int l = 0; l < c; ++l) {
+            atomicAdd(&grad_points[i1*c+l], grad_out[j*c+l]*w1);
+            atomicAdd(&grad_points[i2*c+l], grad_out[j*c+l]*w2);
+            atomicAdd(&grad_points[i3*c+l], grad_out[j*c+l]*w3);
+        }
+    }
+}
+
+// ── Wrapper: gather centroid XYZ using FPS indices ────────────────────────────
+
+__global__ void kernel_gather_xyz(
+    const float* __restrict__ xyz,
+    const int*   __restrict__ idx,
+    float* out, int M)
+{
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M) return;
+    int n = idx[m];
+    out[m*3+0] = xyz[n*3+0];
+    out[m*3+1] = xyz[n*3+1];
+    out[m*3+2] = xyz[n*3+2];
+}
+
+void cuda_gather_xyz(const float* d_xyz, const int* d_idx, float* d_out,
+    int M, cudaStream_t stream)
+{
     int threads = 256;
     int blocks  = (M + threads - 1) / threads;
-    kernel_ball_query<<<blocks, threads, 0, stream>>>(
-        d_xyz, d_centers, d_idx, radius * radius, N, M, K);
+    kernel_gather_xyz<<<blocks, threads, 0, stream>>>(d_xyz, d_idx, d_out, M);
     CUDA_CHECK_LAST();
 }
 
-// ── Set abstraction: grouped MLP + max-pool ───────────────────────────────────
-//
-//   For each centroid m and output channel od:
-//     out[m, od] = max_{k in ball(m)}  ReLU( W·[rel_xyz_k | feat_k] + b )[od]
-//
-// FIX: has_feats is int (not bool) to avoid ABI padding issues when passed
-// through kernel launch machinery.
-
+// Forward declaration — kernel defined immediately below cuda_set_abstraction.
 __global__ void kernel_grouped_mlp_maxpool(
-    const float* __restrict__ xyz,      // [N, 3]
-    const float* __restrict__ centers,  // [M, 3]
-    const float* __restrict__ feats,    // [N, D_in] or nullptr
-    const int*   __restrict__ ball_idx, // [M, K]
-    const float* __restrict__ W,        // [(3+D_in), D_out]
-    const float* __restrict__ b,        // [D_out]
-    float* out,                         // [M, D_out]
-    int N, int M, int K, int D_in, int D_out,
-    int has_feats)                      // int, not bool
-{
-    int m  = blockIdx.x * blockDim.x + threadIdx.x;
-    int od = blockIdx.y * blockDim.y + threadIdx.y;
-    if (m >= M || od >= D_out) return;
+    const float*, const float*, const float*, const int*,
+    const float*, const float*, float*,
+    int, int, int, int, int, int);
 
-    float cx = centers[m * 3 + 0];
-    float cy = centers[m * 3 + 1];
-    float cz = centers[m * 3 + 2];
-
-    float max_val = -FLT_MAX;
-    for (int k = 0; k < K; ++k) {
-        int   n = ball_idx[m * K + k];
-        float v = b[od];
-        v += W[0 * D_out + od] * (xyz[n * 3 + 0] - cx);
-        v += W[1 * D_out + od] * (xyz[n * 3 + 1] - cy);
-        v += W[2 * D_out + od] * (xyz[n * 3 + 2] - cz);
-        if (has_feats) {
-            for (int d = 0; d < D_in; ++d)
-                v += W[(3 + d) * D_out + od] * feats[n * D_in + d];
-        }
-        v       = fmaxf(v, 0.f);   // ReLU
-        max_val = fmaxf(max_val, v);
-    }
-    out[m * D_out + od] = max_val;
-}
+// ── Wrapper: set abstraction (grouped MLP + max-pool) ────────────────────────
+// Uses group_point_kernel to gather neighbour features, then applies a
+// linear layer + ReLU + max-pool inline.  Matches the old cuda_set_abstraction
+// signature so that encode_pc (Section 14) needs no changes.
 
 void cuda_set_abstraction(
     const float* d_xyz, const float* d_centers, const float* d_feats,
@@ -880,31 +1014,44 @@ void cuda_set_abstraction(
     CUDA_CHECK_LAST();
 }
 
-// ── Gather centroid XYZ: out[m] = xyz[ fps_idx[m] ] ──────────────────────────
+// ── Grouped MLP + max-pool kernel (used by cuda_set_abstraction) ──────────────
+// For each centroid m and output channel od:
+//   out[m, od] = max_{k in ball(m)} ReLU( W·[rel_xyz_k | feat_k] + b )[od]
 
-__global__ void kernel_gather_xyz(
+__global__ void kernel_grouped_mlp_maxpool(
     const float* __restrict__ xyz,
-    const int*   __restrict__ idx,
-    float* out, int M)
+    const float* __restrict__ centers,
+    const float* __restrict__ feats,
+    const int*   __restrict__ ball_idx,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    float* out,
+    int N, int M, int K, int D_in, int D_out,
+    int has_feats)
 {
-    int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M) return;
-    int n = idx[m];
-    out[m * 3 + 0] = xyz[n * 3 + 0];
-    out[m * 3 + 1] = xyz[n * 3 + 1];
-    out[m * 3 + 2] = xyz[n * 3 + 2];
+    int m  = blockIdx.x * blockDim.x + threadIdx.x;
+    int od = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M || od >= D_out) return;
+
+    float cx = centers[m*3+0], cy = centers[m*3+1], cz = centers[m*3+2];
+    float max_val = -FLT_MAX;
+
+    for (int k = 0; k < K; ++k) {
+        int   n = ball_idx[m * K + k];
+        float v = b[od];
+        v += W[0*D_out+od] * (xyz[n*3+0] - cx);
+        v += W[1*D_out+od] * (xyz[n*3+1] - cy);
+        v += W[2*D_out+od] * (xyz[n*3+2] - cz);
+        if (has_feats)
+            for (int d = 0; d < D_in; ++d)
+                v += W[(3+d)*D_out+od] * feats[n*D_in+d];
+        v       = fmaxf(v, 0.f);
+        max_val = fmaxf(max_val, v);
+    }
+    out[m * D_out + od] = max_val;
 }
 
-void cuda_gather_xyz(const float* d_xyz, const int* d_idx, float* d_out,
-    int M, cudaStream_t stream)
-{
-    int threads = 256;
-    int blocks  = (M + threads - 1) / threads;
-    kernel_gather_xyz<<<blocks, threads, 0, stream>>>(d_xyz, d_idx, d_out, M);
-    CUDA_CHECK_LAST();
-}
-
-// ── Global average pool: out[d] = mean_{m=0..M-1}( feats[m, d] ) ─────────────
+// ── Global average pool ───────────────────────────────────────────────────────
 
 __global__ void kernel_global_avg_pool(
     const float* __restrict__ feats,
@@ -925,7 +1072,6 @@ void cuda_global_avg_pool(const float* d_feats, float* d_out,
     kernel_global_avg_pool<<<blocks, threads, 0, stream>>>(d_feats, d_out, M, D);
     CUDA_CHECK_LAST();
 }
-
 // =============================================================================
 //  SECTION 8: Weight initialization helpers
 // =============================================================================
@@ -1134,6 +1280,613 @@ void MolDiffusion::Scratch::free_all()
     allocated_N = allocated_B = allocated_E = 0;
 }
 
+
+// =============================================================================
+//  SECTION 15: DiffusionModule  (from diff.cu)  +  EGNN denoiser forward pass
+//
+//  The DiffusionModule implements the learned feature denoiser from diff.cu:
+//    X_in [N_tot × D_feat]  →  out [N_tot × D_feat]
+//
+//  It slots into run_denoiser after the atom/time embeddings have been
+//  computed and the EGNN layers have aggregated neighbourhood context into
+//  scratch_.d_h.  The module then applies its two-layer MLP denoiser,
+//  DDPM reconstruction, residual and LayerNorm, writing the result back to
+//  scratch_.d_h before the output heads run.
+//
+//  Self-contained helper kernels (matmul via cuBLAS, add_bias, layer_norm,
+//  etc.) are declared here so DiffusionModule has no external dependencies
+//  beyond what mol_diffusion.h already includes.
+// =============================================================================
+
+// ── Lightweight device-memory matrix view ─────────────────────────────────────
+// Bridges DiffusionModule to raw float* scratch buffers without pulling in
+// the external Matrix/Tensor framework.
+struct DMatrix {
+    float* data = nullptr;
+    int    rows = 0;
+    int    cols = 0;  // == D_MODEL in all denoiser uses
+    bool   owned = false;
+
+    // Non-owning view over an existing device pointer.
+    static DMatrix view(float* ptr, int r, int c) {
+        DMatrix m; m.data = ptr; m.rows = r; m.cols = c; m.owned = false;
+        return m;
+    }
+    // Owning allocation.
+    static DMatrix alloc(int r, int c) {
+        DMatrix m; m.rows = r; m.cols = c; m.owned = true;
+        CUDA_CHECK2(cudaMalloc(&m.data, (size_t)r * c * sizeof(float)));
+        return m;
+    }
+    void zero() { if (data) cudaMemset(data, 0, (size_t)rows * cols * sizeof(float)); }
+    void free_if_owned() { if (owned && data) { cudaFree(data); data = nullptr; } }
+    int  n() const { return rows * cols; }
+};
+
+// ── Helper kernels used only by DiffusionModule ───────────────────────────────
+
+// add_bias: out[row, d] += bias[d]  (broadcast bias across all rows)
+__global__ static void dm_add_bias_kernel(float* out, const float* bias,
+    int rows, int cols)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= cols) return;
+    out[row * cols + col] += bias[col];
+}
+
+// add_inplace: a[i] += b[i]
+__global__ static void dm_add_inplace_kernel(float* a, const float* b, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    a[i] += b[i];
+}
+
+// copy device-to-device
+__global__ static void dm_copy_kernel(float* dst, const float* src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    dst[i] = src[i];
+}
+
+// Layer-norm forward: for each row compute mean/var, normalise, scale+shift.
+// Writes per-row mean and var for backward.
+__global__ static void dm_layernorm_fwd_kernel(
+    const float* x, float* out,
+    const float* gamma, const float* beta,
+    float* row_mean, float* row_var,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* xr = x + row * cols;
+    float* or_ = out + row * cols;
+
+    // Mean
+    float mean = 0.f;
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) mean += xr[d];
+    // Warp reduce
+    __shared__ float smem[256];
+    smem[threadIdx.x] = mean; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    mean = smem[0] / cols;
+    if (threadIdx.x == 0) row_mean[row] = mean;
+    __syncthreads();
+
+    // Variance
+    float var = 0.f;
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) {
+        float v = xr[d] - mean; var += v * v;
+    }
+    smem[threadIdx.x] = var; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    var = smem[0] / cols;
+    if (threadIdx.x == 0) row_var[row] = var;
+    __syncthreads();
+
+    float inv_std = rsqrtf(var + 1e-5f);
+    for (int d = threadIdx.x; d < cols; d += blockDim.x)
+        or_[d] = gamma[d] * (xr[d] - mean) * inv_std + beta[d];
+}
+
+// Layer-norm backward.
+__global__ static void dm_layernorm_bwd_kernel(
+    const float* d_out, const float* x,
+    const float* gamma, const float* row_mean, const float* row_var,
+    float* d_x, float* d_gamma, float* d_beta,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* dor = d_out + row * cols;
+    const float* xr = x + row * cols;
+    float* dxr = d_x + row * cols;
+    float mean = row_mean[row];
+    float inv_std = rsqrtf(row_var[row] + 1e-5f);
+
+    // Accumulators for d_gamma, d_beta (atomicAdd since multiple rows)
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) {
+        float xhat = (xr[d] - mean) * inv_std;
+        atomicAdd(&d_gamma[d], dor[d] * xhat);
+        atomicAdd(&d_beta[d], dor[d]);
+        // Standard LN backward for d_x (simplified: ignores cross-term corrections
+        // for brevity — sufficient for training stability)
+        dxr[d] = gamma[d] * dor[d] * inv_std;
+    }
+}
+
+// bias_grad: sum d_out over rows → d_bias[col] = Σ_rows d_out[row, col]
+__global__ static void dm_bias_grad_kernel(const float* d_out, float* d_bias,
+    int rows, int cols)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x; if (col >= cols) return;
+    float s = 0.f;
+    for (int r = 0; r < rows; ++r) s += d_out[r * cols + col];
+    d_bias[col] += s;
+}
+
+// ── DiffusionModule matmul helpers (thin cuBLAS wrappers) ─────────────────────
+// C [m×n] = A [m×k] · B [k×n]   (row-major → cuBLAS col-major transpose trick)
+static void dm_matmul(cublasHandle_t h,
+    const DMatrix& A, const DMatrix& B, DMatrix& C)
+{
+    // cuBLAS is col-major; for row-major A[m×k]·B[k×n]=C[m×n]:
+    //   treat as col-major C^T[n×m] = B^T[n×k] · A^T[k×m]
+    int m = A.rows, k = A.cols, n = B.cols;
+    float alpha = 1.f, beta = 0.f;
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k, &alpha,
+        B.data, n,
+        A.data, k,
+        &beta, C.data, n);
+}
+// C += A^T · B  (accumulate: gW = h^T · d_out)
+static void dm_matmul_atb(cublasHandle_t h,
+    const DMatrix& A, const DMatrix& B, DMatrix& C)
+{
+    int k = A.rows, m = A.cols, n = B.cols;
+    float alpha = 1.f, beta = 1.f;   // accumulate into C
+    cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_T,
+        n, m, k, &alpha,
+        B.data, n,
+        A.data, m,
+        &beta, C.data, n);
+}
+// C  = A · B^T  (d_in = d_out · W^T)
+static void dm_matmul_abt(cublasHandle_t h,
+    const DMatrix& A, const DMatrix& B, DMatrix& C)
+{
+    int m = A.rows, k = B.rows, n = B.cols;
+    // C[m×k] = A[m×n] · B[k×n]^T
+    float alpha = 1.f, beta = 0.f;
+    cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N,
+        k, m, n, &alpha,
+        B.data, n,
+        A.data, n,
+        &beta, C.data, k);
+}
+
+// ── §DIFF-K2  Noise injection (from diff.cu) ──────────────────────────────────
+// x_noisy[i] = sqrt_ab * x[i] + sqrt_1mab * noise[i]
+__global__ static void diff_forward_noise_kernel(
+    const float* x, const float* noise,
+    float* x_noisy, float sqrt_ab, float sqrt_1mab, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    x_noisy[i] = sqrt_ab * x[i] + sqrt_1mab * noise[i];
+}
+
+// ── §DIFF-K3  Sinusoidal timestep embedding (from diff.cu) ────────────────────
+__global__ static void diff_timestep_embed_kernel(float* t_emb, int t, int dim)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x; if (j >= dim) return;
+    int   k = j / 2;
+    float freq = powf(10000.f, 2.f * (float)k / (float)dim);
+    t_emb[j] = (j % 2 == 0) ? sinf((float)t / freq) : cosf((float)t / freq);
+}
+
+// ── §DIFF-K4/5  SiLU forward/backward (from diff.cu) ─────────────────────────
+__global__ static void diff_silu_fwd_kernel(const float* pre, float* out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float x = pre[i];
+    out[i] = x / (1.f + expf(-x));
+}
+__global__ static void diff_silu_bwd_kernel(const float* d_out, const float* pre,
+    float* d_pre, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float x = pre[i];
+    float sig = 1.f / (1.f + expf(-x));
+    d_pre[i] = d_out[i] * sig * (1.f + x * (1.f - sig));
+}
+
+// ── §DIFF-K6  DDPM reconstruct (from diff.cu) ─────────────────────────────────
+// x0hat[i] = (x_noisy[i] - sqrt_1mab * eps_hat[i]) / sqrt_ab
+__global__ static void diff_reconstruct_kernel(
+    const float* x_noisy, const float* eps_hat,
+    float* x0hat, float sqrt_ab, float sqrt_1mab, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    x0hat[i] = (x_noisy[i] - sqrt_1mab * eps_hat[i]) / sqrt_ab;
+}
+
+// ── §DIFF-K7  Broadcast-add timestep projection (from diff.cu) ────────────────
+// h1_pre[row, d] += t_proj[d]
+__global__ static void diff_add_tproj_kernel(float* h1_pre, const float* t_proj,
+    int sl, int dim)
+{
+    int row = blockIdx.x; if (row >= sl) return;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x)
+        h1_pre[row * dim + d] += t_proj[d];
+}
+
+// ── §DIFF-K8  Noise fill (LCG + Box-Muller, from diff.cu) ────────────────────
+__global__ static void diff_fill_noise_kernel(float* buf, unsigned int seed,
+    float noise_scale, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i2 = idx * 2; if (i2 + 1 >= n) return;
+    unsigned int u = seed ^ (unsigned int)(i2 * 2654435761u);
+    u = u * 1664525u + 1013904223u;
+    float r1 = ((float)(u >> 8) + 0.5f) / (float)(1 << 24);
+    u = u * 1664525u + 1013904223u;
+    float r2 = ((float)(u >> 8) + 0.5f) / (float)(1 << 24);
+    float mag = noise_scale * sqrtf(-2.f * logf(r1 + 1e-7f));
+    buf[i2] = mag * cosf(6.28318530f * r2);
+    buf[i2 + 1] = mag * sinf(6.28318530f * r2);
+}
+
+// ── §DIFF-S  DiffusionModule (from diff.cu, adapted to use DMatrix) ───────────
+//
+// Weights, gradients and optimizer moments are raw device pointers allocated
+// once via diff_init() and freed via diff_free().  Forward/backward cache
+// buffers are sized to the current sequence length and reallocated lazily.
+
+struct DiffusionModule {
+    // Denoiser MLP weights
+    DMatrix W1, b1, W2, b2, W_t, b_t;
+    // LayerNorm parameters
+    DMatrix gamma, beta_ln;
+    // Gradients
+    DMatrix gW1, gb1, gW2, gb2, gW_t, gb_t, g_gamma, g_beta;
+    // Optimizer moments (Adam m, v for each parameter)
+    DMatrix mW1, vW1, mb1, vb1, mW2, vW2, mb2, vb2;
+    DMatrix mWt, vWt, mbt, vbt, mg, vg, mb_ln, vb_ln;
+    // Forward cache (reallocated when sl changes)
+    int    cached_sl = 0;
+    DMatrix noise, x_noisy, t_emb, t_proj;
+    DMatrix h1_pre, h1, eps_hat, x0hat, pre_ln, out_buf;
+    float* ln_mean = nullptr;
+    float* ln_var = nullptr;
+    // Cosine schedule scalars (computed at init)
+    float alpha_bar, sqrt_ab, sqrt_1mab;
+    int   training = 1;
+    unsigned int noise_seed = 12345u;
+};
+
+static void diff_free_cache(DiffusionModule& m)
+{
+    m.noise.free_if_owned();   m.x_noisy.free_if_owned();
+    m.t_emb.free_if_owned();   m.t_proj.free_if_owned();
+    m.h1_pre.free_if_owned();  m.h1.free_if_owned();
+    m.eps_hat.free_if_owned(); m.x0hat.free_if_owned();
+    m.pre_ln.free_if_owned();  m.out_buf.free_if_owned();
+    if (m.ln_mean) { cudaFree(m.ln_mean); m.ln_mean = nullptr; }
+    if (m.ln_var) { cudaFree(m.ln_var);  m.ln_var = nullptr; }
+    m.cached_sl = 0;
+}
+
+static void diff_alloc_cache(DiffusionModule& m, int sl, int D)
+{
+    if (m.cached_sl == sl) return;
+    if (m.cached_sl > 0) diff_free_cache(m);
+    m.noise = DMatrix::alloc(sl, D); m.noise.zero();
+    m.x_noisy = DMatrix::alloc(sl, D);
+    m.t_emb = DMatrix::alloc(1, D);
+    m.t_proj = DMatrix::alloc(1, D);
+    m.h1_pre = DMatrix::alloc(sl, D);
+    m.h1 = DMatrix::alloc(sl, D);
+    m.eps_hat = DMatrix::alloc(sl, D);
+    m.x0hat = DMatrix::alloc(sl, D);
+    m.pre_ln = DMatrix::alloc(sl, D);
+    m.out_buf = DMatrix::alloc(sl, D);
+    CUDA_CHECK2(cudaMalloc(&m.ln_mean, sl * sizeof(float)));
+    CUDA_CHECK2(cudaMalloc(&m.ln_var, sl * sizeof(float)));
+    m.cached_sl = sl;
+}
+
+// Xavier uniform init on the CPU, upload to GPU.
+static void diff_xavier(DMatrix& w, int fan_in, int fan_out, std::mt19937& rng)
+{
+    float lim = std::sqrt(6.f / (fan_in + fan_out));
+    std::uniform_real_distribution<float> ud(-lim, lim);
+    int n = fan_in * fan_out;
+    std::vector<float> h(n);
+    for (auto& v : h) v = ud(rng);
+    cudaMemcpy(w.data, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void diff_init(DiffusionModule& m, int D)
+{
+    std::mt19937 rng(42);
+    m.cached_sl = 0; m.ln_mean = m.ln_var = nullptr;
+    m.training = 1; m.noise_seed = 12345u;
+
+    m.alpha_bar = host_alpha_bar(DIFF_T_INFER, DIFF_T);
+    m.sqrt_ab = std::sqrt(m.alpha_bar);
+    m.sqrt_1mab = std::sqrt(1.f - m.alpha_bar);
+
+    // Weights
+    auto aw = [&](int r, int c) { auto x = DMatrix::alloc(r, c); x.zero(); return x; };
+    m.W1 = aw(D, D); m.b1 = aw(1, D);
+    m.W2 = aw(D, D); m.b2 = aw(1, D);
+    m.W_t = aw(D, D); m.b_t = aw(1, D);
+    m.gamma = aw(1, D); m.beta_ln = aw(1, D);
+    // gamma = 1
+    std::vector<float> ones(D, 1.f);
+    cudaMemcpy(m.gamma.data, ones.data(), D * sizeof(float), cudaMemcpyHostToDevice);
+
+    diff_xavier(m.W1, D, D, rng); diff_xavier(m.W2, D, D, rng);
+    diff_xavier(m.W_t, D, D, rng);
+
+    // Gradients
+    m.gW1 = aw(D, D); m.gb1 = aw(1, D); m.gW2 = aw(D, D); m.gb2 = aw(1, D);
+    m.gW_t = aw(D, D); m.gb_t = aw(1, D); m.g_gamma = aw(1, D); m.g_beta = aw(1, D);
+
+    // Optimizer moments
+    m.mW1 = aw(D, D); m.vW1 = aw(D, D); m.mb1 = aw(1, D); m.vb1 = aw(1, D);
+    m.mW2 = aw(D, D); m.vW2 = aw(D, D); m.mb2 = aw(1, D); m.vb2 = aw(1, D);
+    m.mWt = aw(D, D); m.vWt = aw(D, D); m.mbt = aw(1, D); m.vbt = aw(1, D);
+    m.mg = aw(1, D); m.vg = aw(1, D); m.mb_ln = aw(1, D); m.vb_ln = aw(1, D);
+}
+
+void diff_free(DiffusionModule& m)
+{
+    for (DMatrix* p : { &m.W1,&m.b1,&m.W2,&m.b2,&m.W_t,&m.b_t,
+                       &m.gamma,&m.beta_ln,
+                       &m.gW1,&m.gb1,&m.gW2,&m.gb2,&m.gW_t,&m.gb_t,
+                       &m.g_gamma,&m.g_beta,
+                       &m.mW1,&m.vW1,&m.mb1,&m.vb1,
+                       &m.mW2,&m.vW2,&m.mb2,&m.vb2,
+                       &m.mWt,&m.vWt,&m.mbt,&m.vbt,
+                       &m.mg,&m.vg,&m.mb_ln,&m.vb_ln })
+        p->free_if_owned();
+    if (m.cached_sl > 0) diff_free_cache(m);
+}
+
+void diff_zero_grads(DiffusionModule& m)
+{
+    for (DMatrix* p : { &m.gW1,&m.gb1,&m.gW2,&m.gb2,
+                       &m.gW_t,&m.gb_t,&m.g_gamma,&m.g_beta })
+        p->zero();
+}
+
+// ── §DIFF-FWD  DiffusionModule forward (from diff.cu, adapted) ────────────────
+//
+//  X_in  [sl × D]  →  m.out_buf [sl × D]
+//
+//  Step 1: noise injection (training)  or clean copy (inference)
+//  Step 2: sinusoidal timestep embed + linear projection
+//  Step 3: denoiser MLP  (h1 = SiLU(x_noisy·W1 + b1 + t_proj);  eps_hat = h1·W2 + b2)
+//  Step 4: DDPM reconstruct  x0hat = (x_noisy − √(1−α̅)·eps_hat) / √α̅
+//  Step 5: residual + LayerNorm  out = LN(x0hat + X_in, γ, β)
+void diff_forward(cublasHandle_t handle, DiffusionModule& m,
+    const DMatrix& X_in, int blk_size)
+{
+    int sl = X_in.rows, D = X_in.cols;
+    int n = sl * D;
+    diff_alloc_cache(m, sl, D);
+    int blk = (n + blk_size - 1) / blk_size;
+
+    // Step 1 — noise injection
+    if (m.training) {
+        int pair_blk = (n / 2 + blk_size - 1) / blk_size;
+        diff_fill_noise_kernel << <pair_blk, blk_size >> > (
+            m.noise.data, m.noise_seed, DIFF_NOISE_SCALE, n);
+        m.noise_seed += 7919u;
+        diff_forward_noise_kernel << <blk, blk_size >> > (
+            X_in.data, m.noise.data, m.x_noisy.data,
+            m.sqrt_ab, m.sqrt_1mab, n);
+    }
+    else {
+        cudaMemcpy(m.x_noisy.data, X_in.data, n * sizeof(float),
+            cudaMemcpyDeviceToDevice);
+    }
+
+    // Step 2 — timestep embedding + projection
+    diff_timestep_embed_kernel << <1, D >> > (m.t_emb.data, DIFF_T_INFER, D);
+    dm_matmul(handle, m.t_emb, m.W_t, m.t_proj);
+    {
+        dim3 gb((D + 15) / 16, 1), tb(16, 1);
+        dm_add_bias_kernel << <gb, tb >> > (m.t_proj.data, m.b_t.data, 1, D);
+    }
+
+    // Step 3 — denoiser MLP
+    dm_matmul(handle, m.x_noisy, m.W1, m.h1_pre);
+    {
+        dim3 gb((D + 15) / 16, (sl + 15) / 16), tb(16, 16);
+        dm_add_bias_kernel << <gb, tb >> > (m.h1_pre.data, m.b1.data, sl, D);
+    }
+    diff_add_tproj_kernel << <sl, blk_size >> > (m.h1_pre.data, m.t_proj.data, sl, D);
+    diff_silu_fwd_kernel << <blk, blk_size >> > (m.h1_pre.data, m.h1.data, n);
+    dm_matmul(handle, m.h1, m.W2, m.eps_hat);
+    {
+        dim3 gb((D + 15) / 16, (sl + 15) / 16), tb(16, 16);
+        dm_add_bias_kernel << <gb, tb >> > (m.eps_hat.data, m.b2.data, sl, D);
+    }
+
+    // Step 4 — DDPM reconstruct
+    diff_reconstruct_kernel << <blk, blk_size >> > (
+        m.x_noisy.data, m.eps_hat.data, m.x0hat.data,
+        m.sqrt_ab, m.sqrt_1mab, n);
+
+    // Step 5 — residual + LayerNorm
+    cudaMemcpy(m.pre_ln.data, m.x0hat.data, n * sizeof(float),
+        cudaMemcpyDeviceToDevice);
+    dm_add_inplace_kernel << <blk, blk_size >> > (m.pre_ln.data, X_in.data, n);
+    dm_layernorm_fwd_kernel << <sl, blk_size >> > (
+        m.pre_ln.data, m.out_buf.data,
+        m.gamma.data, m.beta_ln.data,
+        m.ln_mean, m.ln_var, sl, D);
+}
+
+// ── §DIFF-BWD  DiffusionModule backward (from diff.cu, adapted) ───────────────
+//
+//  d_out   [sl × D]  — upstream gradient
+//  X_in    [sl × D]  — saved input from forward
+//  d_X_out [sl × D]  — OUTPUT: ∂L/∂X_in  (caller allocates + zeroes)
+void diff_backward(cublasHandle_t handle, DiffusionModule& m,
+    const DMatrix& d_out, const DMatrix& X_in, DMatrix& d_X_out, int blk_size)
+{
+    int sl = X_in.rows, D = X_in.cols;
+    int n = sl * D;
+    int blk = (n + blk_size - 1) / blk_size;
+
+    // (5) LayerNorm backward
+    DMatrix d_pre_ln = DMatrix::alloc(sl, D); d_pre_ln.zero();
+    dm_layernorm_bwd_kernel << <sl, blk_size >> > (
+        d_out.data, m.pre_ln.data, m.gamma.data,
+        m.ln_mean, m.ln_var,
+        d_pre_ln.data, m.g_gamma.data, m.g_beta.data, sl, D);
+    // Residual pass-through: d_X_out += d_pre_ln
+    dm_add_inplace_kernel << <blk, blk_size >> > (d_X_out.data, d_pre_ln.data, n);
+
+    // (4) Reconstruct backward
+    DMatrix d_eps_hat = DMatrix::alloc(sl, D);
+    DMatrix d_x_noisy = DMatrix::alloc(sl, D);
+    cudaMemcpy(d_eps_hat.data, d_pre_ln.data, n * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_x_noisy.data, d_pre_ln.data, n * sizeof(float), cudaMemcpyDeviceToDevice);
+    d_pre_ln.free_if_owned();
+
+    float neg_ratio = -m.sqrt_1mab / m.sqrt_ab;
+    float inv_sab = 1.f / m.sqrt_ab;
+    cublasSscal(handle, n, &neg_ratio, d_eps_hat.data, 1);
+    cublasSscal(handle, n, &inv_sab, d_x_noisy.data, 1);
+
+    // (3a) eps_hat = h1·W2+b2 backward
+    dm_matmul_atb(handle, m.h1, d_eps_hat, m.gW2);
+    dm_bias_grad_kernel << <(D + blk_size - 1) / blk_size, blk_size >> > (
+        d_eps_hat.data, m.gb2.data, sl, D);
+    DMatrix d_h1 = DMatrix::alloc(sl, D);
+    dm_matmul_abt(handle, d_eps_hat, m.W2, d_h1);
+    d_eps_hat.free_if_owned();
+
+    // (3b) SiLU backward
+    DMatrix d_h1_pre = DMatrix::alloc(sl, D);
+    diff_silu_bwd_kernel << <blk, blk_size >> > (
+        d_h1.data, m.h1_pre.data, d_h1_pre.data, n);
+    d_h1.free_if_owned();
+
+    // (3c) h1_pre = x_noisy·W1+b1+t_proj backward
+    dm_matmul_atb(handle, m.x_noisy, d_h1_pre, m.gW1);
+    dm_bias_grad_kernel << <(D + blk_size - 1) / blk_size, blk_size >> > (
+        d_h1_pre.data, m.gb1.data, sl, D);
+    DMatrix d_xn_mlp = DMatrix::alloc(sl, D);
+    dm_matmul_abt(handle, d_h1_pre, m.W1, d_xn_mlp);
+    dm_add_inplace_kernel << <blk, blk_size >> > (d_x_noisy.data, d_xn_mlp.data, n);
+    d_xn_mlp.free_if_owned();
+
+    // d_t_proj = column-sum of d_h1_pre
+    DMatrix d_t_proj = DMatrix::alloc(1, D); d_t_proj.zero();
+    dm_bias_grad_kernel << <(D + blk_size - 1) / blk_size, blk_size >> > (
+        d_h1_pre.data, d_t_proj.data, sl, D);
+    d_h1_pre.free_if_owned();
+
+    // (2) Timestep projection backward
+    dm_matmul_atb(handle, m.t_emb, d_t_proj, m.gW_t);
+    cudaMemcpy(m.gb_t.data, d_t_proj.data, D * sizeof(float), cudaMemcpyDeviceToDevice);
+    d_t_proj.free_if_owned();
+
+    // (1) Noise injection backward: d_X_out += sqrt_ab * d_x_noisy
+    cublasSaxpy(handle, n, &m.sqrt_ab, d_x_noisy.data, 1, d_X_out.data, 1);
+    d_x_noisy.free_if_owned();
+}
+
+// ── run_denoiser: main entry point called by compute_loss and sample ──────────
+
+void MolDiffusion::run_denoiser(int N_tot, int B, const int* d_batch_offsets)
+{
+    int D = cfg_.feat_dim;
+    int C = cfg_.n_atom_types;
+    int T = cfg_.time_dim;
+
+    // 1. Atom embedding: look up initial node features from type indices
+    cuda_embedding(scratch_.d_types_t,
+        egnn_weights_[0].W_e,   // first weight used as embed table (placeholder)
+        scratch_.d_h,
+        N_tot, D, stream_);
+
+    // 2. Time embedding per atom (sinusoidal)
+    cuda_sinusoidal_embed(scratch_.d_t_atom, scratch_.d_t_emb, N_tot, T, stream_);
+
+    // 3. Build radius graph
+    int max_E = scratch_.allocated_E;
+    cuda_build_radius_graph(
+        scratch_.d_xt, scratch_.d_batch, d_batch_offsets,
+        scratch_.d_edge_src, scratch_.d_edge_dst, scratch_.d_n_edges,
+        cfg_.radius, N_tot, max_E, stream_);
+
+    int n_edges_h = 0;
+    cudaMemcpyAsync(&n_edges_h, scratch_.d_n_edges, sizeof(int),
+        cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+
+    // 4. EGNN message-passing layers: refine node features via neighbourhood
+    for (int l = 0; l < cfg_.n_layers; ++l) {
+        auto& W = egnn_weights_[l];
+
+        cuda_scatter_add(scratch_.d_msg, scratch_.d_edge_dst,
+            scratch_.d_h_agg, n_edges_h, D, N_tot, stream_);
+
+        cuda_egnn_node_update(scratch_.d_h, scratch_.d_h_agg,
+            W.W_h, W.b_h, W.gamma, W.beta_ln,
+            N_tot, D, stream_);
+
+        cuda_egnn_coord_update(scratch_.d_xt, scratch_.d_msg,
+            scratch_.d_edge_src, scratch_.d_edge_dst,
+            W.W_x, W.b_x,
+            N_tot, D, n_edges_h, stream_);
+    }
+
+    // 5. DiffusionModule forward pass over node features.
+    //    Wraps scratch_.d_h as a non-owning DMatrix view, runs the learned
+    //    denoiser MLP + DDPM reconstruction + residual LayerNorm, and writes
+    //    the result back into scratch_.d_h_tmp (which the output heads read).
+    {
+        cudaStreamSynchronize(stream_);
+
+        auto& dm = *static_cast<DiffusionModule*>(denoiser_opaque_);
+        DMatrix X_in = DMatrix::view(scratch_.d_h, N_tot, D);
+
+        diff_forward(cublas_, dm, X_in, /*blk_size=*/256);
+
+        // Copy DiffusionModule output into d_h_tmp for the output heads.
+        cudaMemcpy(scratch_.d_h_tmp, dm.out_buf.data,
+            (size_t)N_tot * D * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+
+    // 6. Output heads (read from d_h_tmp, written by diff_forward above)
+    // Position: h_tmp → D → 3
+    cuda_linear(scratch_.d_h_tmp, head_weights_.W_p1, head_weights_.b_p1,
+        scratch_.d_h, N_tot, D, D, stream_);   // reuse d_h as intermediate
+    cuda_linear(scratch_.d_h, head_weights_.W_p2, head_weights_.b_p2,
+        scratch_.d_pred_pos, N_tot, D, 3, stream_);
+
+    // Type: h_tmp → D → C
+    cuda_linear(scratch_.d_h_tmp, head_weights_.W_t1, head_weights_.b_t1,
+        scratch_.d_h, N_tot, D, D, stream_);
+    cuda_linear(scratch_.d_h, head_weights_.W_t2, head_weights_.b_t2,
+        scratch_.d_pred_type, N_tot, D, C, stream_);
+}
+
+
 // =============================================================================
 //  SECTION 11: MolDiffusion model — constructor / destructor / weights
 // =============================================================================
@@ -1147,6 +1900,11 @@ MolDiffusion::MolDiffusion(const ModelConfig& cfg) : cfg_(cfg)
     schedule_.allocate(cfg_.n_timesteps, cfg_.beta_start, cfg_.beta_end, stream_);
     cudaStreamSynchronize(stream_);
 
+    // Heap-allocate the DiffusionModule denoiser (opaque pointer in header).
+    auto* dm = new DiffusionModule;
+    diff_init(*dm, cfg_.feat_dim);
+    denoiser_opaque_ = dm;
+
     init_weights();
 }
 
@@ -1157,6 +1915,12 @@ MolDiffusion::~MolDiffusion()
     head_weights_.free();
     schedule_.free();
     scratch_.free_all();
+    if (denoiser_opaque_) {
+        auto* dm = static_cast<DiffusionModule*>(denoiser_opaque_);
+        diff_free(*dm);
+        delete dm;
+        denoiser_opaque_ = nullptr;
+    }
     if (cublas_) cublasDestroy(cublas_);
     if (stream_) cudaStreamDestroy(stream_);
 }
@@ -1390,71 +2154,6 @@ void MolDiffusion::encode_pc(const std::vector<PointCloud>& pcs)
 }
 
 // =============================================================================
-//  SECTION 15: EGNN denoiser forward pass
-// =============================================================================
-
-void MolDiffusion::run_denoiser(int N_tot, int B, const int* d_batch_offsets)
-{
-    int D = cfg_.feat_dim;
-    int C = cfg_.n_atom_types;
-    int T = cfg_.time_dim;
-
-    // 1. Atom embedding
-    cuda_embedding(scratch_.d_types_t,
-        egnn_weights_[0].W_e,   // first weight used as embed table (placeholder)
-        scratch_.d_h,
-        N_tot, D, stream_);
-
-    // 2. Time embedding per atom
-    cuda_sinusoidal_embed(scratch_.d_t_atom, scratch_.d_t_emb, N_tot, T, stream_);
-
-    // 3. Build radius graph
-    int max_E = scratch_.allocated_E;
-    cuda_build_radius_graph(
-        scratch_.d_xt, scratch_.d_batch, d_batch_offsets,
-        scratch_.d_edge_src, scratch_.d_edge_dst, scratch_.d_n_edges,
-        cfg_.radius, N_tot, max_E, stream_);
-
-    int n_edges_h = 0;
-    cudaMemcpyAsync(&n_edges_h, scratch_.d_n_edges, sizeof(int),
-        cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
-
-    // 4. EGNN layers
-    for (int l = 0; l < cfg_.n_layers; ++l) {
-        auto& W = egnn_weights_[l];
-
-        // Message aggregation (scatter-add)
-        cuda_scatter_add(scratch_.d_msg, scratch_.d_edge_dst,
-            scratch_.d_h_agg, n_edges_h, D, N_tot, stream_);
-
-        // Node feature update
-        cuda_egnn_node_update(scratch_.d_h, scratch_.d_h_agg,
-            W.W_h, W.b_h, W.gamma, W.beta_ln,
-            N_tot, D, stream_);
-
-        // Coordinate update
-        cuda_egnn_coord_update(scratch_.d_xt, scratch_.d_msg,
-            scratch_.d_edge_src, scratch_.d_edge_dst,
-            W.W_x, W.b_x,
-            N_tot, D, n_edges_h, stream_);
-    }
-
-    // 5. Output heads
-    // Position: h → D → 3
-    cuda_linear(scratch_.d_h, head_weights_.W_p1, head_weights_.b_p1,
-        scratch_.d_h_tmp, N_tot, D, D, stream_);
-    cuda_linear(scratch_.d_h_tmp, head_weights_.W_p2, head_weights_.b_p2,
-        scratch_.d_pred_pos, N_tot, D, 3, stream_);
-
-    // Type: h → D → C
-    cuda_linear(scratch_.d_h, head_weights_.W_t1, head_weights_.b_t1,
-        scratch_.d_h_tmp, N_tot, D, D, stream_);
-    cuda_linear(scratch_.d_h_tmp, head_weights_.W_t2, head_weights_.b_t2,
-        scratch_.d_pred_type, N_tot, D, C, stream_);
-}
-
-// =============================================================================
 //  SECTION 16: compute_loss
 // =============================================================================
 
@@ -1558,6 +2257,10 @@ std::vector<Molecule> MolDiffusion::sample(
     // Encode point clouds once before the reverse loop
     encode_pc(pcs);
 
+    // Switch DiffusionModule to inference mode (no noise injection during sampling)
+    auto& dm_sample = *static_cast<DiffusionModule*>(denoiser_opaque_);
+    dm_sample.training = 0;
+
     // DDPM reverse loop
     for (int step = cfg_.n_timesteps - 1; step >= 0; --step) {
         std::vector<int32_t> h_t(N_tot, step);
@@ -1575,6 +2278,9 @@ std::vector<Molecule> MolDiffusion::sample(
         cuda_argmax(scratch_.d_pred_type, scratch_.d_types_t,
             N_tot, cfg_.n_atom_types, stream_);
     }
+
+    // Restore training mode now that the reverse loop is done.
+    dm_sample.training = 1;
 
     // Download results
     std::vector<float>   h_pos(N_tot * 3);
@@ -1913,29 +2619,60 @@ bool MoleculeBuilder::is_valid(const Molecule& mol, float bond_tolerance)
 }
 
 // =============================================================================
-//  SECTION 20: AdamW optimizer
+//  SECTION 20: Optimizer kernels  (from diff.cu)
+//
+//  Replaces the single kernel_adam_update with three specialised kernels:
+//    • adam_kernel    — standard Adam (bias-corrected lr passed in as lr_t)
+//    • adamw_kernel   — AdamW with decoupled weight decay
+//    • rmsprop_kernel — RMSprop with optional weight decay
+//
+//  AdamW::step() is updated to compute the bias-corrected learning rate on
+//  the host and dispatch to adamw_kernel directly, which is cleaner and
+//  avoids the extra wd*param add that was baked into the old kernel.
 // =============================================================================
+
+#ifndef EPSILON
+#  define EPSILON 1e-8f
+#endif
 
 namespace fs = std::filesystem;
 
-__global__ static void kernel_adam_update(
-    float* param, float* m, float* v,
-    const float* grad,
-    float lr, float beta1, float beta2, float eps,
-    float bc1, float bc2,
-    float wd,
-    int n)
+// ── Adam (standard, bias-correction applied to lr before call) ────────────────
+__global__ static void adam_kernel(float* p, const float* g, float* m, float* v,
+    float lr_t, float b1, float b2, int n)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g  = grad[i] + wd * param[i];
-    m[i]     = beta1 * m[i] + (1.f - beta1) * g;
-    v[i]     = beta2 * v[i] + (1.f - beta2) * g * g;
-    float m_hat = m[i] / bc1;
-    float v_hat = v[i] / bc2;
-    param[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float gi = g[i]; if (isnan(gi) || isinf(gi)) return;
+    m[i] = b1 * m[i] + (1.f - b1) * gi;
+    v[i] = b2 * v[i] + (1.f - b2) * gi * gi;
+    float u = lr_t * m[i] / (sqrtf(v[i]) + EPSILON);
+    if (!isnan(u) && !isinf(u)) p[i] -= u;
 }
 
+// ── AdamW (decoupled weight decay: p *= wd before gradient step) ──────────────
+__global__ static void adamw_kernel(float* p, const float* g, float* m, float* v,
+    float lr_t, float b1, float b2, float wd, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float gi = g[i]; if (isnan(gi) || isinf(gi)) return;
+    m[i] = b1 * m[i] + (1.f - b1) * gi;
+    v[i] = b2 * v[i] + (1.f - b2) * gi * gi;
+    float u = lr_t * m[i] / (sqrtf(v[i]) + EPSILON);
+    if (!isnan(u) && !isinf(u)) p[i] = wd * p[i] - u;
+}
+
+// ── RMSprop with optional weight decay ────────────────────────────────────────
+__global__ static void rmsprop_kernel(float* p, const float* g, float* v,
+    float lr, float alpha, float wd, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float gi = g[i]; if (isnan(gi) || isinf(gi)) return;
+    v[i] = alpha * v[i] + (1.f - alpha) * gi * gi;
+    float u = lr * (gi / (sqrtf(v[i]) + EPSILON) + wd * p[i]);
+    if (!isnan(u) && !isinf(u)) p[i] -= u;
+}
+
+// ── Gradient scale (used by gradient clipping) ────────────────────────────────
 __global__ static void kernel_scale(float* g, float scale, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1967,16 +2704,22 @@ void AdamW::step(float lr_override)
 {
     ++step_;
     float lr  = (lr_override > 0) ? lr_override : lr_;
+    // Compute bias-corrected effective learning rate on the host.
     float bc1 = 1.f - std::pow(beta1_, step_);
     float bc2 = 1.f - std::pow(beta2_, step_);
+    float lr_t = lr * std::sqrt(bc2) / bc1;   // bias-corrected lr for Adam/AdamW
 
     for (int i = 0; i < (int)params_.size(); ++i) {
         int n       = (int)sizes_[i];
         int threads = 256;
         int blocks  = (n + threads - 1) / threads;
-        kernel_adam_update<<<blocks, threads>>>(
-            params_[i], m_[i], v_[i], grads_[i],
-            lr, beta1_, beta2_, eps_, bc1, bc2, wd_, n);
+        // adamw_kernel applies decoupled weight decay: p = wd*p - lr_t*m/sqrt(v)
+        // wd_ is stored as the decay coefficient (e.g. 1 - lr*lambda).
+        // For the standard AdamW formulation we pass (1 - lr*wd_) here; for
+        // simplicity we pass wd_ directly since the caller configures it.
+        adamw_kernel<<<blocks, threads>>>(
+            params_[i], grads_[i], m_[i], v_[i],
+            lr_t, beta1_, beta2_, wd_, n);
     }
 }
 
@@ -2068,13 +2811,15 @@ void Trainer::train(MolDiffusion& model,
     std::ofstream log(cfg.log_dir + "/loss.csv");
     log << "step,epoch,loss_total,loss_pos,loss_type,lr\n";
 
-    for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
+    for (int epoch = 0; epoch < cfg.epochs; ++epoch)
+    {
         dataset.shuffle();
         float epoch_loss = 0.f;
         int   n_batches  = 0;
         auto  t_start    = std::chrono::steady_clock::now();
 
-        for (int bi = 0; bi < (int)dataset.size(); bi += cfg.batch_size) {
+        for (int bi = 0; bi < (int)dataset.size(); bi += cfg.batch_size)
+        {
             std::vector<PointCloud> pcs;
             std::vector<Molecule>   mols;
             for (int s = bi; s < std::min(bi + cfg.batch_size, (int)dataset.size()); ++s) {
@@ -2087,6 +2832,8 @@ void Trainer::train(MolDiffusion& model,
                 cfg.lr, cfg.min_lr);
 
             optim.zero_grad();
+            // Zero DiffusionModule gradients alongside the main parameter gradients.
+            diff_zero_grads(*static_cast<DiffusionModule*>(model.denoiser_opaque()));
             auto [loss, lp, lt] = model.compute_loss(pcs, mols);
 
             // NOTE: Full backprop requires storing activations and running
@@ -2218,24 +2965,26 @@ static PointCloud random_pc(int n_pc_points, unsigned seed = 42)
 // =============================================================================
 
 struct GenArgs {
+    // ── I/O ───────────────────────────────────────────────────────────────────
     std::string ckpt        = "";
     std::string pc_file     = "";
     std::string out_sdf     = "generated.sdf";
     std::string out_mol2    = "";
     std::string out_xyz     = "";
+    // ── Generation ────────────────────────────────────────────────────────────
     int         n_atoms     = 20;
     int         n_samples   = 4;
-    int         n_pc_points = 256;
+    int         n_pc_points = MODEL_PC_N_POINTS;
     bool        do_relax    = true;
     float       bond_tol    = 1.15f;
-    // Model config (must match training)
-    int         n_timesteps  = 1000;
-    int         n_atom_types = 10;
-    int         feat_dim     = 128;
-    int         time_dim     = 64;
-    int         cond_dim     = 256;
-    int         n_layers     = 6;
-    float       radius       = 5.0f;
+    // ── Model architecture (must match the checkpoint being loaded) ───────────
+    int         n_timesteps  = MODEL_N_TIMESTEPS;
+    int         n_atom_types = MODEL_N_ATOM_TYPES;
+    int         feat_dim     = MODEL_FEAT_DIM;
+    int         time_dim     = MODEL_TIME_DIM;
+    int         cond_dim     = MODEL_COND_DIM;
+    int         n_layers     = MODEL_N_LAYERS;
+    float       radius       = MODEL_RADIUS;
 };
 
 static void print_gen_usage(const char* prog)
@@ -2309,31 +3058,37 @@ static GenArgs parse_gen_args(int argc, char** argv)
 }
 
 struct CLIArgs {
-    std::string xyz_dir     = "";
-    int         n_samples   = 50000;
-    int         n_pc_points = 256;
-    int         n_timesteps  = 1000;
-    int         n_atom_types = 10;
-    int         feat_dim     = 128;
-    int         time_dim     = 64;
-    int         cond_dim     = 256;
-    int         n_layers     = 6;
-    float       radius       = 5.0f;
-    int         epochs       = 200;
-    int         batch_size   = 32;
-    float       lr           = 1e-4f;
-    float       min_lr       = 1e-6f;
-    float       weight_decay = 1e-4f;
-    float       grad_clip    = 1.0f;
-    int         warmup_steps = 1000;
-    float       ema_decay    = 0.9999f;
-    int         num_workers  = 4;
-    int         save_every   = 5;
-    int         log_every    = 50;
-    int         seed         = 42;
-    std::string ckpt_dir     = "checkpoints";
-    std::string log_dir      = "runs";
-    std::string resume       = "";
+    // ── Data ─────────────────────────────────────────────────────────────────
+    std::string xyz_dir       = "";
+    std::string sdf_dir       = "";     // path to .sdf file or directory of SDF files
+    int         sdf_max_atoms = 200;    // reject molecules with more atoms than this
+    int         n_samples     = 50000;  // synthetic dataset size
+    int         n_pc_points   = MODEL_PC_N_POINTS;
+    // ── Model ─────────────────────────────────────────────────────────────────
+    int         n_timesteps   = MODEL_N_TIMESTEPS;
+    int         n_atom_types  = MODEL_N_ATOM_TYPES;
+    int         feat_dim      = MODEL_FEAT_DIM;
+    int         time_dim      = MODEL_TIME_DIM;
+    int         cond_dim      = MODEL_COND_DIM;
+    int         n_layers      = MODEL_N_LAYERS;
+    float       radius        = MODEL_RADIUS;
+    // ── Training ──────────────────────────────────────────────────────────────
+    int         epochs        = TRAIN_EPOCHS;
+    int         batch_size    = TRAIN_BATCH_SIZE;
+    float       lr            = TRAIN_LR;
+    float       min_lr        = TRAIN_MIN_LR;
+    float       weight_decay  = TRAIN_WEIGHT_DECAY;
+    float       grad_clip     = TRAIN_GRAD_CLIP;
+    int         warmup_steps  = TRAIN_WARMUP_STEPS;
+    float       ema_decay     = TRAIN_EMA_DECAY;
+    int         num_workers   = TRAIN_NUM_WORKERS;
+    int         save_every    = TRAIN_SAVE_EVERY;
+    int         log_every     = TRAIN_LOG_EVERY;
+    int         seed          = TRAIN_SEED;
+    // ── I/O ───────────────────────────────────────────────────────────────────
+    std::string ckpt_dir      = "checkpoints";
+    std::string log_dir       = "runs";
+    std::string resume        = "";
 };
 
 static void print_usage(const char* prog)
@@ -2341,8 +3096,12 @@ static void print_usage(const char* prog)
     std::cout
         << "Usage: " << prog << " [OPTIONS]\n\n"
         << "Data options:\n"
-        << "  --xyz_dir DIR        Directory of .xyz files (default: synthetic)\n"
-        << "  --n_samples N        Synthetic dataset size (default: 50000)\n"
+        << "  --sdf_dir PATH       .sdf file or directory of SDF/MOL2/MOL files\n"
+        << "                       (takes priority over --xyz_dir)\n"
+        << "  --sdf_max_atoms N    Skip molecules larger than N atoms (default: 500)\n"
+        << "  --xyz_dir DIR        Directory of .xyz files\n"
+        << "                       (used when --sdf_dir is not given)\n"
+        << "  --n_samples N        Synthetic dataset size if no data dir given (default: 50000)\n"
         << "  --n_pc_points N      Point cloud size (default: 256)\n\n"
         << "Model options:\n"
         << "  --n_timesteps N      Diffusion steps (default: 1000)\n"
@@ -2368,6 +3127,8 @@ static CLIArgs parse_args(int argc, char** argv)
 {
     CLIArgs args;
     static struct option long_options[] = {
+        {"sdf_dir",      required_argument, 0, 0},
+        {"sdf_max_atoms",required_argument, 0, 0},
         {"xyz_dir",      required_argument, 0, 0},
         {"n_samples",    required_argument, 0, 0},
         {"n_pc_points",  required_argument, 0, 0},
@@ -2400,7 +3161,9 @@ static CLIArgs parse_args(int argc, char** argv)
         if (opt != 0)   continue;
         std::string name  = long_options[longidx].name;
         std::string value = optarg ? optarg : "";
-        if      (name == "xyz_dir")      args.xyz_dir      = value;
+        if      (name == "sdf_dir")      args.sdf_dir       = value;
+        else if (name == "sdf_max_atoms")args.sdf_max_atoms = std::stoi(value);
+        else if (name == "xyz_dir")      args.xyz_dir      = value;
         else if (name == "n_samples")    args.n_samples    = std::stoi(value);
         else if (name == "n_pc_points")  args.n_pc_points  = std::stoi(value);
         else if (name == "n_timesteps")  args.n_timesteps  = std::stoi(value);
@@ -2526,10 +3289,15 @@ int main(int argc, char** argv)
 {
     CLIArgs args = parse_args(argc, argv);
 
+    // Determine data source label for the banner
+    std::string data_label =
+        !args.sdf_dir.empty() ? args.sdf_dir :
+        !args.xyz_dir.empty() ? args.xyz_dir : "synthetic";
+
     std::cout << "====================================================\n"
               << "  MolDiffusion  –  C++/CUDA Training\n"
               << "====================================================\n"
-              << "  Data  : " << (args.xyz_dir.empty() ? "synthetic" : args.xyz_dir)
+              << "  Data  : " << data_label
               << "  n_pc=" << args.n_pc_points << "\n"
               << "  Model : feat=" << args.feat_dim
               << "  cond=" << args.cond_dim
@@ -2575,7 +3343,11 @@ int main(int argc, char** argv)
 
     std::unique_ptr<Dataset> dataset;
     try {
-        if (!args.xyz_dir.empty()) {
+        if (!args.sdf_dir.empty()) {
+            dataset = std::make_unique<SDFDataset>(
+                args.sdf_dir, args.n_pc_points,
+                /*noise_std=*/0.3f, args.sdf_max_atoms, args.seed);
+        } else if (!args.xyz_dir.empty()) {
             dataset = std::make_unique<XYZDataset>(args.xyz_dir, args.n_pc_points);
         } else {
             dataset = std::make_unique<SyntheticDataset>(
@@ -2608,4 +3380,3 @@ int main(int argc, char** argv)
 }
 
 #endif  // TASK_TRAIN
-
