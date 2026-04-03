@@ -4,9 +4,100 @@
 #include <device_launch_parameters.h>
 #include <cublas_v2.h>
 
+// =============================================================================
+//  Default model parameters — override any of these at compile time, e.g.:
+//    nvcc -DMODEL_FEAT_DIM=256 -DTRAIN_BATCH_SIZE=64 ...
+//
+//  ModelConfig and TrainConfig use these as their default member values, so
+//  default-constructed configs automatically pick up the defines.  Fields set
+//  explicitly at runtime (e.g. from CLI args) still override as before.
+// =============================================================================
+
+// ── Diffusion schedule (also consumed directly by DiffusionModule kernels) ────
+#ifndef DIFF_T
+#  define DIFF_T                1000      // total diffusion timesteps T
+#endif
+#ifndef DIFF_T_INFER
+#  define DIFF_T_INFER           500      // timestep used at inference
+#endif
+#ifndef DIFF_NOISE_SCALE
+#  define DIFF_NOISE_SCALE       0.15f    // noise magnitude during training
+#endif
+
+// ── ModelConfig defaults ──────────────────────────────────────────────────────
+#ifndef MODEL_N_TIMESTEPS
+#  define MODEL_N_TIMESTEPS      DIFF_T   // kept in sync with DIFF_T by default
+#endif
+#ifndef MODEL_BETA_START
+#  define MODEL_BETA_START       1e-4f
+#endif
+#ifndef MODEL_BETA_END
+#  define MODEL_BETA_END         2e-2f
+#endif
+#ifndef MODEL_COND_DIM
+#  define MODEL_COND_DIM         1024      // PointNet++ output / conditioning dim
+#endif
+#ifndef MODEL_PC_N_POINTS
+#  define MODEL_PC_N_POINTS      1024      // point cloud size fed to the encoder
+#endif
+#ifndef MODEL_FEAT_DIM
+#  define MODEL_FEAT_DIM         512      // EGNN node feature dimension
+#endif
+#ifndef MODEL_TIME_DIM
+#  define MODEL_TIME_DIM         256       // sinusoidal timestep embedding dim
+#endif
+#ifndef MODEL_N_LAYERS
+#  define MODEL_N_LAYERS         8        // EGNN message-passing layers
+#endif
+#ifndef MODEL_RADIUS
+#  define MODEL_RADIUS           5.0f     // radius-graph cutoff (Angstroms)
+#endif
+#ifndef MODEL_N_ATOM_TYPES
+#  define MODEL_N_ATOM_TYPES     11       // must match N_ATOM_TYPES / ATOM_SYMBOLS
+#endif
+
+// ── TrainConfig defaults ──────────────────────────────────────────────────────
+#ifndef TRAIN_EPOCHS
+#  define TRAIN_EPOCHS           200
+#endif
+#ifndef TRAIN_BATCH_SIZE
+#  define TRAIN_BATCH_SIZE       32
+#endif
+#ifndef TRAIN_LR
+#  define TRAIN_LR               1e-4f
+#endif
+#ifndef TRAIN_MIN_LR
+#  define TRAIN_MIN_LR           1e-6f
+#endif
+#ifndef TRAIN_WEIGHT_DECAY
+#  define TRAIN_WEIGHT_DECAY     1e-4f
+#endif
+#ifndef TRAIN_GRAD_CLIP
+#  define TRAIN_GRAD_CLIP        1.0f
+#endif
+#ifndef TRAIN_WARMUP_STEPS
+#  define TRAIN_WARMUP_STEPS     1000
+#endif
+#ifndef TRAIN_EMA_DECAY
+#  define TRAIN_EMA_DECAY        0.9999f
+#endif
+#ifndef TRAIN_NUM_WORKERS
+#  define TRAIN_NUM_WORKERS      4
+#endif
+#ifndef TRAIN_SAVE_EVERY
+#  define TRAIN_SAVE_EVERY       5
+#endif
+#ifndef TRAIN_LOG_EVERY
+#  define TRAIN_LOG_EVERY        50
+#endif
+#ifndef TRAIN_SEED
+#  define TRAIN_SEED             42
+#endif
+
 #include <stdio.h>
 #include <math.h>
 #include <cstdint>
+#include <cctype>
 #include <float.h>
 
 #include <getopt.h>
@@ -130,12 +221,12 @@ struct HeadWeights {
 // ─────────────────────────────────────────────────────────────────────────────
 // Atom type mapping (matches Python reference code)
 // ─────────────────────────────────────────────────────────────────────────────
-constexpr int N_ATOM_TYPES = 10;
+constexpr int N_ATOM_TYPES = 11;
 static const char* ATOM_SYMBOLS[N_ATOM_TYPES] = {
-    "H", "C", "N", "O", "F", "S", "Cl", "Br", "P", "I"
+    "H", "C", "N", "O", "F", "S", "Cl", "Br", "P", "I",  "B"
 };
 static const int ATOM_VALENCE[N_ATOM_TYPES] = {
-    1,   4,   3,   2,   1,   2,    1,    1,   5,   1
+    1,   4,   3,   2,   1,   2,    1,    1,   5,   1,   3
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,45 +340,45 @@ private:
 // Model hyper-parameters (all in one struct)
 // ─────────────────────────────────────────────────────────────────────────────
 struct ModelConfig {
-    // Diffusion
-    int   n_timesteps = 1000;
-    float beta_start = 1e-4f;
-    float beta_end = 2e-2f;
+    // Diffusion schedule
+    int   n_timesteps  = MODEL_N_TIMESTEPS;
+    float beta_start   = MODEL_BETA_START;
+    float beta_end     = MODEL_BETA_END;
 
     // PointNet++ encoder
-    int   cond_dim = 256;
-    int   pc_n_points = 256;
+    int   cond_dim     = MODEL_COND_DIM;
+    int   pc_n_points  = MODEL_PC_N_POINTS;
 
     // EGNN denoiser
-    int   feat_dim = 128;
-    int   time_dim = 64;
-    int   n_layers = 6;
-    float radius = 5.0f;   // Angstroms
+    int   feat_dim     = MODEL_FEAT_DIM;
+    int   time_dim     = MODEL_TIME_DIM;
+    int   n_layers     = MODEL_N_LAYERS;
+    float radius       = MODEL_RADIUS;    // Angstroms
 
     // Atom types
-    int   n_atom_types = N_ATOM_TYPES;
+    int   n_atom_types = MODEL_N_ATOM_TYPES;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Training hyper-parameters
 // ─────────────────────────────────────────────────────────────────────────────
 struct TrainConfig {
-    int   epochs = 200;
-    int   batch_size = 32;
-    float lr = 1e-4f;
-    float min_lr = 1e-6f;
-    float weight_decay = 1e-4f;
-    float grad_clip = 1.0f;
-    int   warmup_steps = 1000;
-    float ema_decay = 0.9999f;
-    int   num_workers = 4;
-    bool  use_amp = true;
-    int   save_every = 5;
-    int   log_every = 50;
-    int   seed = 42;
-    std::string ckpt_dir = "checkpoints";
-    std::string log_dir = "runs";
-    std::string resume = "";
+    int         epochs        = TRAIN_EPOCHS;
+    int         batch_size    = TRAIN_BATCH_SIZE;
+    float       lr            = TRAIN_LR;
+    float       min_lr        = TRAIN_MIN_LR;
+    float       weight_decay  = TRAIN_WEIGHT_DECAY;
+    float       grad_clip     = TRAIN_GRAD_CLIP;
+    int         warmup_steps  = TRAIN_WARMUP_STEPS;
+    float       ema_decay     = TRAIN_EMA_DECAY;
+    int         num_workers   = TRAIN_NUM_WORKERS;
+    bool        use_amp       = true;
+    int         save_every    = TRAIN_SAVE_EVERY;
+    int         log_every     = TRAIN_LOG_EVERY;
+    int         seed          = TRAIN_SEED;
+    std::string ckpt_dir      = "checkpoints";
+    std::string log_dir       = "runs";
+    std::string resume        = "";
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -425,6 +516,188 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SDF parsing helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// parse_sdf_stream
+//
+// Reads every molecule from an already-open OBConversion input stream and
+// appends parsed Molecule objects to `out`.  Returns the number appended.
+//
+// Atom type mapping follows get_sym_map(): unknown elements default to C (1).
+// Molecules with 0 atoms or more than max_atoms are skipped silently.
+// Conformer coordinates are taken from the first (and usually only) conformer.
+inline int parse_sdf_stream(OBConversion& conv, int max_atoms,
+    std::vector<Molecule>& out)
+{
+    const auto& sym_map = get_sym_map();
+    int added = 0;
+    OBMol obmol;
+    while (conv.Read(&obmol)) {
+        obmol.DeleteHydrogens();          // strip explicit H — match training convention
+        int n = static_cast<int>(obmol.NumAtoms());
+        if (n <= 0 || n > max_atoms) { obmol.Clear(); continue; }
+
+        Molecule mol;
+        mol.resize(n);
+
+        int idx = 0;
+        FOR_ATOMS_OF_MOL(a, obmol) {
+            // Atom type
+            std::string sym = OBElements::GetSymbol(a->GetAtomicNum());
+            auto it = sym_map.find(sym);
+            mol.atom_types[idx] = (it != sym_map.end()) ? it->second : 1;
+
+            // 3-D coordinates (Angstroms)
+            mol.pos[idx * 3 + 0] = static_cast<float>(a->GetX());
+            mol.pos[idx * 3 + 1] = static_cast<float>(a->GetY());
+            mol.pos[idx * 3 + 2] = static_cast<float>(a->GetZ());
+            ++idx;
+        }
+
+        // Guard: OB iterator count must match NumAtoms
+        if (idx != n) { obmol.Clear(); continue; }
+
+        out.push_back(std::move(mol));
+        ++added;
+        obmol.Clear();
+    }
+    return added;
+}
+
+// parse_sdf_file
+//
+// Parses a single .sdf / .mol2 / .mol file.  Format is inferred from the
+// file extension; falls back to "sdf" if unrecognised.
+// Returns true if at least one molecule was read successfully.
+inline bool parse_sdf_file(const std::string& path, int max_atoms,
+    std::vector<Molecule>& out)
+{
+    OBConversion conv;
+
+    // Infer format from extension
+    std::string ext;
+    auto dot = path.rfind('.');
+    if (dot != std::string::npos) ext = path.substr(dot + 1);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+
+    const char* fmt = "sdf";
+    if (ext == "mol2")      fmt = "mol2";
+    else if (ext == "mol")  fmt = "mol";
+    else if (ext == "sdf")  fmt = "sdf";
+
+    if (!conv.SetInFormat(fmt)) {
+        std::cerr << "[SDFDataset] Unknown format '" << fmt
+                  << "' for file: " << path << "\n";
+        return false;
+    }
+
+    std::ifstream ifs(path);
+    if (!ifs) {
+        std::cerr << "[SDFDataset] Cannot open: " << path << "\n";
+        return false;
+    }
+
+    conv.SetInStream(&ifs);
+    int n = parse_sdf_stream(conv, max_atoms, out);
+    return n > 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SDFDataset
+//
+// Loads molecules from one of:
+//   a) A single .sdf / .mol2 file (multi-record)
+//   b) A directory — scans recursively for all *.sdf, *.mol2, *.mol files
+//
+// For each molecule a point cloud is derived the same way as XYZDataset:
+// noisy copies of atom positions + interpolated surface points.
+//
+// Molecules are rejected if they have 0 atoms, more than max_atoms (default
+// 500), or no valid 3-D coordinates (all-zero after stripping H).
+//
+// Usage:
+//   SDFDataset ds("/data/qm9.sdf", 256);          // single multi-record SDF
+//   SDFDataset ds("/data/molecules/", 256);        // directory of SDF files
+// ─────────────────────────────────────────────────────────────────────────────
+class SDFDataset : public Dataset {
+public:
+    SDFDataset(const std::string& path,
+               int   n_pc_points = 256,
+               float noise_std   = 0.3f,
+               int   max_atoms   = 500,
+               int   seed        = 42)
+        : n_pc_points_(n_pc_points), noise_std_(noise_std), rng_(seed)
+    {
+        namespace fs = std::filesystem;
+
+        std::vector<Molecule> mols;
+
+        if (fs::is_directory(path)) {
+            // Scan directory recursively for .sdf / .mol2 / .mol files
+            int file_count = 0;
+            for (auto& entry : fs::recursive_directory_iterator(path)) {
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                if (ext != ".sdf" && ext != ".mol2" && ext != ".mol") continue;
+                parse_sdf_file(entry.path().string(), max_atoms, mols);
+                ++file_count;
+            }
+            std::cout << "[SDFDataset] Scanned " << file_count
+                      << " files in directory: " << path << "\n";
+        } else {
+            // Single file — may contain many records (e.g. QM9, ChEMBL)
+            parse_sdf_file(path, max_atoms, mols);
+        }
+
+        // Reject molecules with no valid 3-D geometry (all coords == 0)
+        int rejected_flat = 0;
+        for (auto& mol : mols) {
+            if (is_flat(mol)) { ++rejected_flat; continue; }
+            PointCloud pc = derive_pc(mol, n_pc_points_, noise_std_, rng_);
+            samples_.push_back({ std::move(pc), std::move(mol) });
+        }
+
+        indices_.resize(samples_.size());
+        std::iota(indices_.begin(), indices_.end(), 0);
+
+        std::cout << "[SDFDataset] Loaded "  << samples_.size()
+                  << " molecules from: "     << path;
+        if (rejected_flat > 0)
+            std::cout << "  (skipped " << rejected_flat << " flat/no-coord)";
+        std::cout << "\n";
+
+        if (samples_.empty())
+            std::cerr << "[SDFDataset] WARNING: no valid molecules loaded from: "
+                      << path << "\n";
+    }
+
+    size_t  size()             const override { return samples_.size(); }
+    Sample& operator[](size_t idx)   override { return samples_[indices_[idx]]; }
+    void    shuffle()                override {
+        std::shuffle(indices_.begin(), indices_.end(), rng_);
+    }
+
+private:
+    // Returns true if all atom positions are exactly zero (no 3-D geometry).
+    static bool is_flat(const Molecule& mol) {
+        for (int i = 0; i < mol.N; ++i) {
+            if (mol.pos[i*3+0] != 0.f ||
+                mol.pos[i*3+1] != 0.f ||
+                mol.pos[i*3+2] != 0.f) return false;
+        }
+        return true;
+    }
+
+    std::vector<Sample> samples_;
+    std::vector<int>    indices_;
+    int   n_pc_points_;
+    float noise_std_;
+    std::mt19937 rng_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SyntheticDataset: random Gaussian molecules + derived point clouds
 // ─────────────────────────────────────────────────────────────────────────────
 class SyntheticDataset : public Dataset {
@@ -531,6 +804,10 @@ public:
 
     const ModelConfig& config() const { return cfg_; }
 
+    // Returns the raw DiffusionModule pointer (void* to avoid header dependency).
+    // Trainer casts this to DiffusionModule* to call diff_zero_grads each step.
+    void* denoiser_opaque() { return denoiser_opaque_; }
+
 private:
     ModelConfig cfg_;
 
@@ -543,6 +820,11 @@ private:
 
     // Noise schedule
     NoiseSchedule schedule_;
+
+    // Learned diffusion denoiser (DiffusionModule defined in mol_diffusion.cu §15).
+    // Held as a void* to avoid exposing DMatrix/DiffusionModule in the header;
+    // cast back to DiffusionModule* in the .cu where the full type is known.
+    void* denoiser_opaque_ = nullptr;
 
     // Weights
     PointNetWeights  pn_weights_;
