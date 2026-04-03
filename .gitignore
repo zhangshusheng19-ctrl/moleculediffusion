@@ -1,0 +1,69 @@
+```
+# Build artifacts
+CMakeFiles/
+cmake-build*/
+build/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Dependencies
+vendor/
+.externalNativeBuild/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.tox/
+
+# C/C++
+*.i
+*.s
+*.ii
+*.sii
+*.gcno
+*.gcda
+*.gcov
+*.stackdump
+*.map
+
+# Temporary files
+*.tmp
+*~
+```
